@@ -981,20 +981,62 @@ function guidedPlane(I, P, w, h, r, eps) {
 function blendPlane(P, target, weight, S) {
   for (var i = 0; i < P.length; i++) { var z = weight[i] * S; if (z < 0.005) continue; var v = P[i] + z * (target[i] - P[i]); P[i] = v < 0 ? 0 : (v > 255 ? 255 : (v + 0.5) | 0); }
 }
-// E: { strength, radius, dehalo, soften, chroma, align, tol }. Returns stats; writes a map (white = edge core, blue = halo band) when emap is given.
-function edgeStage(P, w, h, E, emap) {
-  var n = w * h, Y = P.Y, Cb = P.Cb, Cr = P.Cr, S = E.strength, R = E.radius < 0.35 ? 0.35 : E.radius, i, x, y;
-  var sY = boxBlurPlane(Y, w, h, 1, 1), sCb = boxBlurPlane(Cb, w, h, 1, 1), sCr = boxBlurPlane(Cr, w, h, 1, 1), core = new Float32Array(n);
+// Edge detection that keeps outlines and ignores texture and JPEG blocks:
+// gradient strength x orientation coherence (structure tensor), then any connected piece shorter than minLen is dropped.
+function edgeCore(Y, Cb, Cr, w, h) {
+  var n = w * h, i, x, y, fY = new Float32Array(n), fB = new Float32Array(n), fR = new Float32Array(n);
+  for (i = 0; i < n; i++) { fY[i] = Y[i]; fB[i] = Cb[i]; fR[i] = Cr[i]; }
+  gaussBlur(fY, w, h, 1); gaussBlur(fB, w, h, 1); gaussBlur(fR, w, h, 1);
+  var mag = new Float32Array(n), Jxx = new Float32Array(n), Jyy = new Float32Array(n), Jxy = new Float32Array(n);
   for (y = 1; y < h - 1; y++) for (x = 1; x < w - 1; x++) {
     i = y * w + x;
-    var gx = sY[i + 1] - sY[i - 1], gy = sY[i + w] - sY[i - w], g = Math.sqrt(gx * gx + gy * gy) * 0.5;
-    gx = sCb[i + 1] - sCb[i - 1]; gy = sCb[i + w] - sCb[i - w]; var gc = Math.sqrt(gx * gx + gy * gy) * 0.75; if (gc > g) g = gc;
-    gx = sCr[i + 1] - sCr[i - 1]; gy = sCr[i + w] - sCr[i - w]; gc = Math.sqrt(gx * gx + gy * gy) * 0.75; if (gc > g) g = gc;
-    core[i] = sstep(g, 10, 45);
+    var gx = (fY[i + 1] - fY[i - 1]) * 0.5, gy = (fY[i + w] - fY[i - w]) * 0.5, g2 = gx * gx + gy * gy;
+    var bx = (fB[i + 1] - fB[i - 1]) * 0.75, by = (fB[i + w] - fB[i - w]) * 0.75, b2 = bx * bx + by * by;
+    var rx = (fR[i + 1] - fR[i - 1]) * 0.75, ry = (fR[i + w] - fR[i - w]) * 0.75, r2 = rx * rx + ry * ry;
+    if (b2 > g2) { gx = bx; gy = by; g2 = b2; } if (r2 > g2) { gx = rx; gy = ry; g2 = r2; }
+    mag[i] = Math.sqrt(g2); Jxx[i] = gx * gx; Jyy[i] = gy * gy; Jxy[i] = gx * gy;
   }
-  sY = sCb = sCr = null;
-  var rb = Math.ceil(2 * R + 1), band = boxBlurPlane(rangeFilter(core, w, h, rb, true), w, h, 1, 1);
-  var zone = boxBlurPlane(rangeFilter(core, w, h, Math.max(1, Math.ceil(R)), true), w, h, 1, 1);
+  fY = fB = fR = null;
+  gaussBlur(Jxx, w, h, 1.5); gaussBlur(Jyy, w, h, 1.5); gaussBlur(Jxy, w, h, 1.5);
+  var core = new Float32Array(n);
+  for (i = 0; i < n; i++) {
+    var a = Jxx[i], b = Jyy[i], c = Jxy[i], tr = a + b; if (tr < 1e-3) continue;
+    var coh = ((a - b) * (a - b) + 4 * c * c) / (tr * tr);
+    core[i] = sstep(mag[i], 8, 36) * sstep(coh, 0.3, 0.7);
+  }
+  Jxx = Jyy = Jxy = mag = null;
+  // drop short pieces (texture, block corners, noise): 8-connected components of core > 0.25
+  var minLen = Math.max(10, Math.round(Math.sqrt(n) / 40)), lab = new Int32Array(n), stack = new Int32Array(n), pix = new Int32Array(n), id = 0;
+  for (i = 0; i < n; i++) {
+    if (lab[i] || core[i] <= 0.25) continue;
+    id++; var sp = 0, np = 0; stack[sp++] = i; lab[i] = id;
+    while (sp) {
+      var q = stack[--sp]; pix[np++] = q; var qx = q % w, qy = (q / w) | 0;
+      for (var dy = -1; dy <= 1; dy++) { var yy = qy + dy; if (yy < 0 || yy >= h) continue;
+        for (var dx = -1; dx <= 1; dx++) { var xx = qx + dx; if (xx < 0 || xx >= w) continue; var k = yy * w + xx;
+          if (!lab[k] && core[k] > 0.25) { lab[k] = id; stack[sp++] = k; } } }
+    }
+    if (np < minLen) for (var t = 0; t < np; t++) core[pix[t]] = 0;
+  }
+  for (i = 0; i < n; i++) if (core[i] > 0 && core[i] <= 0.25 && !lab[i]) {   // faint fringe pixels survive only beside a kept piece
+    var x0 = i % w, y0 = (i / w) | 0, keep = false;
+    for (var ey = -1; ey <= 1 && !keep; ey++) for (var ex = -1; ex <= 1; ex++) { var X = x0 + ex, Yy = y0 + ey; if (X >= 0 && X < w && Yy >= 0 && Yy < h && core[Yy * w + X] > 0.25) { keep = true; break; } }
+    if (!keep) core[i] = 0;
+  }
+  return core;
+}
+// Round, soft spread of the edge mask (a square max filter would stamp boxes around every point).
+function spreadMask(core, w, h, sigma) {
+  var f = new Float32Array(core); gaussBlur(f, w, h, sigma);
+  for (var i = 0; i < f.length; i++) { var v = sstep(f[i], 0.03, 0.3); f[i] = v > core[i] ? v : core[i]; }
+  return f;
+}
+// E: { strength, radius, dehalo, soften, chroma, align, tol }. Returns stats; writes a map (white = edge core, blue = halo band) when emap is given.
+function edgeStage(P, w, h, E, emap) {
+  var n = w * h, Y = P.Y, Cb = P.Cb, Cr = P.Cr, S = E.strength, R = E.radius < 0.35 ? 0.35 : E.radius, i;
+  var core = edgeCore(Y, Cb, Cr, w, h);
+  var rb = Math.ceil(2 * R + 1), band = spreadMask(core, w, h, Math.max(1, rb * 0.6));
+  var zone = spreadMask(core, w, h, Math.max(0.7, R * 0.6));
   var stats = { band: 0, halo: 0 }, bc = 0;
   for (i = 0; i < n; i++) if (band[i] > 0.2) bc++;
   stats.band = bc / n;
@@ -1004,7 +1046,7 @@ function edgeStage(P, w, h, E, emap) {
   }
   if (E.soften) { var Yf = new Float32Array(n); for (i = 0; i < n; i++) Yf[i] = Y[i]; gaussBlur(Yf, w, h, R); blendPlane(Y, Yf, zone, S); Yf = null; }
   if (E.chroma) {
-    var cz = boxBlurPlane(rangeFilter(core, w, h, Math.max(1, Math.ceil(R * 1.5)), true), w, h, 1, 1);
+    var cz = spreadMask(core, w, h, Math.max(0.8, R * 0.9));
     [Cb, Cr].forEach(function (C) { var f = new Float32Array(n); for (var k = 0; k < n; k++) f[k] = C[k]; gaussBlur(f, w, h, R * 1.5); blendPlane(C, f, cz, S); });
   }
   if (E.align) {
