@@ -310,19 +310,16 @@ details.adv summary:hover { color: var(--fg); }
           <button type="button" data-bake="off" aria-pressed="true">Off</button>
           <button type="button" data-bake="on" aria-pressed="false">On</button>
         </div>
-        <div class="drop small" id="origDrop"><strong>Original, before your edits</strong> (optional): drop it here or <button class="linkbtn" id="btnOrig" type="button">choose a file</button>. With it, the tool knows exactly which pixels you changed.</div>
-        <div class="file-meta" id="origMeta">No original loaded: edited areas are guessed from where the fingerprint changes.</div>
         <div class="grain-read" id="bakeRead">—</div>
         <div id="bakeGroup" class="group" hidden></div>
         <details class="adv" id="bakeAdv" hidden>
           <summary>Advanced: the individual steps</summary>
-          <label class="chk"><input type="checkbox" id="bSoften" checked><span>Soften the edit to the photo's sharpness<span class="v" id="bSoftenV"></span></span></label>
-          <label class="chk"><input type="checkbox" id="bTone" checked><span>Match blacks and highlight colour<span class="v" id="bToneV"></span></span></label>
-          <label class="chk"><input type="checkbox" id="bChroma" checked><span>Match colour resolution (4:2:0 softness, whole image)<span class="v" id="bChromaV"></span></span></label>
-          <label class="chk"><input type="checkbox" id="bSeam" checked><span>Blend the seam by frequency band (needs the original)<span class="v" id="bSeamV"></span></span></label>
-          <label class="chk"><input type="checkbox" id="bResample" checked><span>Resample to erase compression history (whole image, ½ px)<span class="v" id="bResampleV"></span></span></label>
+          <label class="chk"><input type="checkbox" id="bSoften" checked><span>Unify sharpness<span class="v" id="bSoftenV"></span></span></label>
+          <label class="chk"><input type="checkbox" id="bTone" checked><span>Unify blacks and whites<span class="v" id="bToneV"></span></span></label>
+          <label class="chk"><input type="checkbox" id="bChroma" checked><span>Unify colour resolution<span class="v" id="bChromaV"></span></span></label>
+          <label class="chk"><input type="checkbox" id="bResample" checked><span>Erase compression history<span class="v" id="bResampleV"></span></span></label>
         </details>
-        <p class="note">Reads the photo's fingerprint from the parts you didn't touch and gives the edited parts the same one: softness, colour resolution, black level, highlight saturation, then the seam, then grain last. Everything is measured; the one slider is how far to go. Check the Seam map afterwards: baked looks evenly speckled, an unbaked edit shows as a bright island.</p>
+        <p class="note">Makes the whole image read as one capture, from its own pixels: it finds the image's typical edge sharpness and softens any area that is crisper than that, gives crushed blacks and clipped whites the same soft floor and ceiling, puts all colour at one resolution, and resamples by half a pixel so no old compression grid survives anywhere. Grain is added last. No original needed. Check the Seam map afterwards: an even speckle means nothing stands apart.</p>
       </section>
 
       <section class="sec" id="secGrain">
@@ -337,6 +334,12 @@ details.adv summary:hover { color: var(--fg); }
         <div id="grainAuto" class="group" hidden></div>
         <div id="grainManual" class="group" hidden></div>
         <div id="grainShared" class="group" hidden></div>
+        <div class="group" id="patchHead" style="margin-top:12px"><div class="group-title">Random noise patches</div></div>
+        <div id="patchGroup" class="group"></div>
+        <div class="row">
+          <button class="btn small" id="btnPatchSeed" type="button">New pattern</button>
+          <span class="summary" id="patchSeedOut">pattern 1</span>
+        </div>
         <div class="row" id="grainSeedRow" hidden>
           <button class="btn small" id="btnSeed" type="button">New seed</button>
           <span class="summary" id="seedOut">seed 1</span>
@@ -772,87 +775,50 @@ function gridAt(g, bw, bh, x, y) {
   return (g[r0 + bx0] * (1 - tx) + g[r0 + bx1] * tx) * (1 - ty) + (g[r1 + bx0] * (1 - tx) + g[r1 + bx1] * tx) * ty;
 }
 // Full-resolution bilinear expansion of a block grid (one pass; cheaper than per-pixel lookups in every stage).
-function upsampleGrid(g, bw, bh, w, h) {
+function upsampleGrid(g, bw, bh, w, h, cell) {
+  cell = cell || 8;
   var out = new Float32Array(w * h), x, y;
   var cx0 = new Int32Array(w), cx1 = new Int32Array(w), ctx_ = new Float32Array(w);
-  for (x = 0; x < w; x++) { var fx = (x + 0.5) / 8 - 0.5, b0 = Math.floor(fx), t = fx - b0; if (b0 < 0) { b0 = 0; t = 0; } cx0[x] = b0; cx1[x] = b0 + 1 < bw ? b0 + 1 : bw - 1; ctx_[x] = t; }
+  for (x = 0; x < w; x++) { var fx = (x + 0.5) / cell - 0.5, b0 = Math.floor(fx), t = fx - b0; if (b0 < 0) { b0 = 0; t = 0; } cx0[x] = b0; cx1[x] = b0 + 1 < bw ? b0 + 1 : bw - 1; ctx_[x] = t; }
   for (y = 0; y < h; y++) {
-    var fy = (y + 0.5) / 8 - 0.5, by0 = Math.floor(fy), ty = fy - by0; if (by0 < 0) { by0 = 0; ty = 0; } var by1 = by0 + 1 < bh ? by0 + 1 : bh - 1;
+    var fy = (y + 0.5) / cell - 0.5, by0 = Math.floor(fy), ty = fy - by0; if (by0 < 0) { by0 = 0; ty = 0; } var by1 = by0 + 1 < bh ? by0 + 1 : bh - 1;
     var r0 = by0 * bw, r1 = by1 * bw, o = y * w;
     for (x = 0; x < w; x++) { var tx = ctx_[x], a = g[r0 + cx0[x]] + (g[r0 + cx1[x]] - g[r0 + cx0[x]]) * tx, b = g[r1 + cx0[x]] + (g[r1 + cx1[x]] - g[r1 + cx0[x]]) * tx; out[o + x] = a + (b - a) * ty; }
   }
   return out;
 }
-// Where the edit is. With the original: pixels that differ. Without: blocks whose grain has been smoothed away.
-function editMask(src, orig, w, h, prof) {
-  var bw = (w + 7) >> 3, bh = (h + 7) >> 3, nb = bw * bh, g = new Float32Array(nb), k;
-  if (orig) {
-    var cnt = new Uint16Array(nb), tot = new Uint16Array(nb);
-    for (var y = 0; y < h; y++) { var row = (y >> 3) * bw; for (var x = 0; x < w; x++) {
-      var o = (y * w + x) << 2, d = Math.abs(src[o] - orig[o]), d1 = Math.abs(src[o + 1] - orig[o + 1]), d2 = Math.abs(src[o + 2] - orig[o + 2]);
-      if (d1 > d) d = d1; if (d2 > d) d = d2; var kk = row + (x >> 3); tot[kk]++; if (d > 10) cnt[kk]++;
-    } }
-    var raw = new Float32Array(nb);
-    for (k = 0; k < nb; k++) raw[k] = cnt[k] / tot[k] > 0.12 ? 1 : 0;
-    for (var by = 0; by < bh; by++) for (var bx = 0; bx < bw; bx++) {   // dilate one block
-      var m = 0;
-      for (var dy = -1; dy <= 1; dy++) { var yy = by + dy; if (yy < 0 || yy >= bh) continue; for (var dx = -1; dx <= 1; dx++) { var xx = bx + dx; if (xx < 0 || xx >= bw) continue; if (raw[yy * bw + xx] > m) m = raw[yy * bw + xx]; } }
-      g[by * bw + bx] = m;
-    }
-    smoothGrid(g, bw, bh); smoothGrid(g, bw, bh);
-    return g;
-  }
-  if (!prof || !prof.found) return g;
-  var pl = planesOf(src, w * h), st = residualBlockStats(pl.Y, w, h);
-  for (k = 0; k < nb; k++) {
-    var m2 = st.mean[k], b = m2 >> 3; if (b > 31) b = 31;
-    var f2 = prof.floor[b] * prof.floor[b]; if (f2 < 0.16 || m2 < 6 || m2 > 249) continue;
-    var gate = (1 - st.rvar[k] / f2) / 0.3; g[k] = gate <= 0 ? 0 : (gate > 1 ? 1 : gate);
-  }
-  smoothGrid(g, bw, bh);
-  return g;
-}
-function pct(hist, total, q) { var acc = 0, target = total * q; for (var i = 0; i < 256; i++) { acc += hist[i]; if (acc >= target) return i; } return 255; }
 function median(arr) { if (!arr.length) return 0; arr.sort(function (a, b) { return a - b; }); return arr[arr.length >> 1]; }
-// Fingerprint of the untouched photo versus the edit: edge softness, colour detail, black/white points, highlight saturation.
-function bakeAnalyze(pl, mask, w, h) {
-  var Y = pl.Y, Cb = pl.Cb, Cr = pl.Cr, bw = (w + 7) >> 3, bh = (h + 7) >> 3, n = w * h, i, x, y;
-  var editFrac = 0; for (i = 0; i < mask.length; i++) editFrac += mask[i]; editFrac /= mask.length;
-  var hasMask = editFrac > 0.002 && editFrac < 0.98;
-  var bl = new Float32Array(n);   // 3x3 box of Y: edges measured on this, so noise does not pass for sharpness
+// Bake analysis, from the image's own pixels: typical edge sharpness (and where edges are crisper than it), crushed blacks, clipped whites.
+function bakeAnalyze(pl, w, h) {
+  var Y = pl.Y, n = w * h, i, x, y;
+  var bl = new Float32Array(n);
   for (y = 0; y < h; y++) { var rm = (y > 0 ? y - 1 : 0) * w, r0 = y * w, rp = (y < h - 1 ? y + 1 : h - 1) * w;
     for (x = 0; x < w; x++) { var xm = x > 0 ? x - 1 : 0, xp = x < w - 1 ? x + 1 : w - 1;
       bl[r0 + x] = (Y[rm + xm] + Y[rm + x] + Y[rm + xp] + Y[r0 + xm] + Y[r0 + x] + Y[r0 + xp] + Y[rp + xm] + Y[rp + x] + Y[rp + xp]) * 0.111111111; } }
-  var sN = [], sE = [], cN = [0, 0], cE = [0, 0], hN = new Float32Array(256), hE = new Float32Array(256), tN = 0, tE = 0;
-  var satN = new Float32Array(8), satE = new Float32Array(8), satNc = new Float32Array(8), satEc = new Float32Array(8);
-  var gw = (w + 15) >> 4, gh = (h + 15) >> 4;
+  var gw = (w + 15) >> 4, gh = (h + 15) >> 4, ng = gw * gh, sw = new Float32Array(ng).fill(-1), list = [];
   for (var wy = 0; wy < gh; wy++) for (var wx = 0; wx < gw; wx++) {
-    var x0 = wx << 4, y0 = wy << 4, x1 = x0 + 16 < w ? x0 + 16 : w, y1 = y0 + 16 < h ? y0 + 16 : h;
-    var mb = 0, mc = 0;
-    for (var by = y0 >> 3; by <= (y1 - 1) >> 3; by++) for (var bx = x0 >> 3; bx <= (x1 - 1) >> 3; bx++) { mb += mask[by * bw + bx]; mc++; }
-    mb /= mc;
-    var region = mb >= 0.85 ? 1 : (mb <= 0.15 ? 0 : -1); if (region < 0) continue;
-    var bmin = 255, bmax = 0, gmax = 0, dY = 0, dC = 0;
+    var x0 = wx << 4, y0 = wy << 4, x1 = x0 + 16 < w ? x0 + 16 : w, y1 = y0 + 16 < h ? y0 + 16 : h, bmin = 255, bmax = 0, gmax = 0;
     for (y = y0; y < y1; y++) for (x = x0; x < x1; x++) {
       i = y * w + x; var v = bl[i]; if (v < bmin) bmin = v; if (v > bmax) bmax = v;
       if (x > x0 && x < x1 - 1 && y > y0 && y < y1 - 1) { var gx = (bl[i + 1] - bl[i - 1]) * 0.5, gy = (bl[i + w] - bl[i - w]) * 0.5, gm = gx * gx + gy * gy; if (gm > gmax) gmax = gm; }
-      if (x > x0) { dY += Math.abs(Y[i] - Y[i - 1]); dC += Math.abs(Cb[i] - Cb[i - 1]) + Math.abs(Cr[i] - Cr[i - 1]); }
-      var yv = Y[i], sb = yv >> 5, sat = Math.sqrt((Cb[i] - 128) * (Cb[i] - 128) + (Cr[i] - 128) * (Cr[i] - 128));
-      if (region) { hE[yv]++; tE++; satE[sb] += sat; satEc[sb]++; } else { hN[yv]++; tN++; satN[sb] += sat; satNc[sb]++; }
     }
-    if (bmax - bmin >= 40 && gmax > 0) { var s = (bmax - bmin) / (Math.sqrt(gmax) * 2.5066); if (s < 12) (region ? sE : sN).push(s); }
-    if (bmax - bmin >= 20) { if (region) { cE[0] += dC; cE[1] += dY; } else { cN[0] += dC; cN[1] += dY; } }
+    if (bmax - bmin >= 40 && gmax > 0) { var sv = (bmax - bmin) / (Math.sqrt(gmax) * 2.5066); if (sv < 12) { var t2 = sv * sv - 0.67; sv = t2 > 0 ? Math.sqrt(t2) : 0; sw[wy * gw + wx] = sv; list.push(sv); } }
   }
-  var mN = median(sN), nN = sN.length, nE = sE.length;
-  sE.sort(function (a, b) { return a - b; }); var mE = nE ? sE[Math.floor(nE * 0.3)] : 0;   // the edit's sharpest third sets the target
-  var sigmaMatch = 0; if (nN >= 12 && nE >= 6 && mN > mE) { sigmaMatch = Math.sqrt(mN * mN - mE * mE); if (sigmaMatch > 2.5) sigmaMatch = 2.5; }
-  function trueS(m) { var v = m * m - 0.67; return v > 0 ? Math.sqrt(v) : 0; }   // remove the 3x3 pre-blur's own width
-  var sat = [1, 1, 1], satNv = [0, 0, 0], satEv = [0, 0, 0];
-  for (var b = 5; b < 8; b++) { if (satNc[b] >= 200 && satEc[b] >= 200) { var a = satN[b] / satNc[b], e = satE[b] / satEc[b]; satNv[b - 5] = a; satEv[b - 5] = e; var r = e > 0.5 ? a / e : 1; sat[b - 5] = r < 0.5 ? 0.5 : (r > 1.5 ? 1.5 : r); } }
-  return { editFrac: editFrac, hasMask: hasMask, sN: trueS(mN), sE: trueS(mE), nN: nN, nE: nE, sigmaMatch: sigmaMatch,
-    chromaN: cN[1] > 0 ? cN[0] / cN[1] : 0, chromaE: cE[1] > 0 ? cE[0] / cE[1] : 0,
-    blackN: tN ? pct(hN, tN, 0.005) : 0, blackE: tE ? pct(hE, tE, 0.005) : 0, whiteN: tN ? pct(hN, tN, 0.995) : 255, whiteE: tE ? pct(hE, tE, 0.995) : 255,
-    sat: sat, satN: satNv, satE: satEv, hasTone: tN > 2000 && tE > 2000 };
+  var med = list.length >= 12 ? median(list.slice()) : 0, sig = new Float32Array(ng), sharp = 0, sigMax = 0;
+  if (med > 0.3) for (i = 0; i < ng; i++) {
+    var s0 = sw[i]; if (s0 < 0) continue;
+    if (s0 < med * 0.8) { var d = Math.sqrt(med * med - s0 * s0); if (d > 2.5) d = 2.5; sig[i] = d; sharp++; if (d > sigMax) sigMax = d; }
+  }
+  // spread to neighbours so whole crisp objects are covered, then smooth
+  var sp = new Float32Array(sig);
+  for (y = 0; y < gh; y++) for (x = 0; x < gw; x++) { var mx = 0;
+    for (var dy = -1; dy <= 1; dy++) { var yy = y + dy; if (yy < 0 || yy >= gh) continue; for (var dx = -1; dx <= 1; dx++) { var xx = x + dx; if (xx < 0 || xx >= gw) continue; if (sig[yy * gw + xx] > mx) mx = sig[yy * gw + xx]; } }
+    sp[y * gw + x] = mx; }
+  smoothGrid(sp, gw, gh);
+  var hist = new Float32Array(256); for (i = 0; i < n; i++) hist[Y[i]]++;
+  var crushB = (hist[0] + hist[1]) / n, clipW = (hist[254] + hist[255]) / n;
+  return { gw: gw, gh: gh, sig: sp, sigMax: sigMax, sMed: med, nEdges: list.length, sharpFrac: list.length ? sharp / list.length : 0,
+    crushB: crushB, clipW: clipW, lift: 8 * sstep(crushB, 0.0005, 0.02), roll: 6 * sstep(clipW, 0.0005, 0.02) };
 }
 // Box blur with running sums (O(n) per pass regardless of radius); three passes approximate a Gaussian.
 function boxBlurPlane(src, w, h, r, passes) {
@@ -890,51 +856,45 @@ function halfPixelShift(P, w, h) {
     for (x = 0; x < w; x++) { var x1 = x < w - 1 ? x + 1 : x; P[r0 + x] = (buf[x] + buf[x1] + P[r1 + x] + P[r1 + x1] + 2) >> 2; }
   }
 }
-// B: { strength, soften, tone, chromaEq, seam, resample, sigma (px at this resolution), seamRadius, info }
-// out: edited planes; origOut: the original run through the same edits (or null); ctx.mask: edit mask grid at this resolution.
-function bakeApply(out, origOut, w, h, B, ctx) {
-  var info = B.info, mask = ctx.mask, bw = (w + 7) >> 3, bh = (h + 7) >> 3, n = w * h, S = B.strength, i;
-  var Yo = out.Y, Cbo = out.Cb, Cro = out.Cr, useMask = mask && info && info.hasMask;
-  var M = useMask ? upsampleGrid(mask, bw, bh, w, h) : null;
-  if (useMask && B.tone && info.hasTone) {
-    var lift = info.blackN - info.blackE, roll = info.whiteE - info.whiteN, sat = info.sat;
-    if (lift < 1) lift = 0; if (lift > 24) lift = 24; if (roll < 1) roll = 0; if (roll > 24) roll = 24;
-    var satOn = sat[0] !== 1 || sat[1] !== 1 || sat[2] !== 1;
-    for (i = 0; i < n; i++) {
-      var m = M[i] * S; if (m < 0.005) continue;
-      var yv = Yo[i], nv = yv;
-      if (lift && yv < 64) { var t = 1 - yv / 64; nv += m * lift * t * t; }
-      if (roll && yv > 192) { var t2 = (yv - 192) / 63; nv -= m * roll * t2 * t2; }
-      Yo[i] = nv < 0 ? 0 : (nv > 255 ? 255 : (nv + 0.5) | 0);
-      if (satOn && yv >= 160) { var sc = 1 + m * (sat[(yv >> 5) - 5] - 1); if (sc !== 1) {
-        var cb = 128 + (Cbo[i] - 128) * sc, cr = 128 + (Cro[i] - 128) * sc;
-        Cbo[i] = cb < 0 ? 0 : (cb > 255 ? 255 : (cb + 0.5) | 0); Cro[i] = cr < 0 ? 0 : (cr > 255 ? 255 : (cr + 0.5) | 0); } }
-    }
+// B: { strength, soften, tone, chromaEq, resample }. ctx.bakeA: bakeAnalyze() of the image at this resolution.
+function bakeApply(out, w, h, B, ctx) {
+  var A = ctx.bakeA, n = w * h, S = B.strength, i, Yo = out.Y, Cbo = out.Cb, Cro = out.Cr;
+  if (A && B.tone && (A.lift > 0.3 || A.roll > 0.3)) {
+    var lut = new Uint8Array(256);
+    for (i = 0; i < 256; i++) { var v = i; if (i < 64) { var t = 1 - i / 64; v += S * A.lift * t * t; } if (i > 192) { var t2 = (i - 192) / 63; v -= S * A.roll * t2 * t2; } lut[i] = v < 0 ? 0 : (v > 255 ? 255 : (v + 0.5) | 0); }
+    for (i = 0; i < n; i++) Yo[i] = lut[Yo[i]];
   }
-  if (useMask && B.soften && B.sigma >= 0.2) {
-    var Yf = new Float32Array(n); for (i = 0; i < n; i++) Yf[i] = Yo[i];
-    gaussBlur(Yf, w, h, B.sigma);
-    for (i = 0; i < n; i++) { var m2 = M[i] * S; if (m2 < 0.005) continue; var v = Yo[i] + m2 * (Yf[i] - Yo[i]); Yo[i] = (v + 0.5) | 0; }
-    Yf = null;
+  if (A && B.soften && A.sigMax >= 0.2) {
+    var M = upsampleGrid(A.sig, A.gw, A.gh, w, h, 16), Yf = new Float32Array(n);
+    for (i = 0; i < n; i++) Yf[i] = Yo[i];
+    gaussBlur(Yf, w, h, A.sigMax);
+    var inv = 1 / A.sigMax;
+    for (i = 0; i < n; i++) { var m = M[i] * inv * S; if (m < 0.005) continue; if (m > 1) m = 1; var v2 = Yo[i] + m * (Yf[i] - Yo[i]); Yo[i] = (v2 + 0.5) | 0; }
   }
-  if (useMask && B.seam && origOut) {
-    var mWg = new Float32Array(mask); for (var s = 0; s < 4; s++) smoothGrid(mWg, bw, bh);
-    var MW = upsampleGrid(mWg, bw, bh, w, h);
-    var r = B.seamRadius < 2 ? 2 : B.seamRadius, planes = [[Yo, origOut.Y], [Cbo, origOut.Cb], [Cro, origOut.Cr]];
-    for (var p = 0; p < 3; p++) {
-      var E = planes[p][0], O = planes[p][1], lowE = boxBlurPlane(E, w, h, r, 3), lk = p + '/' + r, lowO = origOut.lowCache && origOut.lowCache[lk];
-      if (!lowO) { lowO = boxBlurPlane(O, w, h, r, 3); if (origOut.lowCache) origOut.lowCache[lk] = lowO; }
-      for (i = 0; i < n; i++) {
-        var mn = M[i], mw = MW[i], lo = lowO[i], le = lowE[i], ov = O[i], ev = E[i];
-        var baked = lo + mw * (le - lo) + (ov - lo) + mn * ((ev - le) - (ov - lo));
-        var v2 = ev + S * (baked - ev); E[i] = v2 < 0 ? 0 : (v2 > 255 ? 255 : (v2 + 0.5) | 0);
-      }
-    }
-    MW = null;
-  }
-  M = null;
   if (B.chromaEq) { chromaEqualize(Cbo, w, h); chromaEqualize(Cro, w, h); }
   if (B.resample) { halfPixelShift(Yo, w, h); halfPixelShift(Cbo, w, h); halfPixelShift(Cro, w, h); }
+}
+
+// ===== Random noise patches: grain that comes and goes across the frame, in soft-edged organic patches. =====
+// N: { amount (sigma at midtones), size (patch scale, px), coverage (0..1), seed, grain (grain size, px) }
+function noisePatches(out, w, h, N, ctx) {
+  var ps = N.size < 4 ? 4 : N.size, gw = Math.ceil(w / ps) + 2, gh = Math.ceil(h / ps) + 2, g = gaussianWhite(gw * gh, N.seed * 131 + 7), i;
+  smoothGrid(g, gw, gh);
+  var sorted = Array.prototype.slice.call(g).sort(function (a, b) { return a - b; });
+  var q = sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor((1 - N.coverage) * sorted.length)))];
+  var spread = (sorted[Math.floor(sorted.length * 0.84)] - sorted[Math.floor(sorted.length * 0.16)]) * 0.35 + 1e-3;
+  var M = upsampleGrid(g, gw, gh, w, h, ps), f = getNoiseField(ctx, w, h, N.grain, N.seed * 977 + 31).data, fc = N.chroma > 0 ? getNoiseField(ctx, w, h, N.grain * 1.6, N.seed * 977 + 32).data : null;
+  var clip = ctx.clipLUT; if (!clip) { clip = ctx.clipLUT = new Float32Array(256); for (i = 0; i < 256; i++) clip[i] = sstep(i, 2, 12) * (1 - sstep(i, 243, 253)); }
+  var Yo = out.Y, Cbo = out.Cb, Cro = out.Cr, map = out.map, n = w * h, half = n >> 1, A = N.amount * 0.03125;
+  for (i = 0; i < n; i++) {
+    var m = sstep(M[i], q - spread, q + spread); if (m < 0.01) continue;
+    var yv = Yo[i], lum = 1.3 - 0.6 * (yv / 255), a = A * m * lum * clip[yv];
+    var v = yv + f[i] * a; Yo[i] = v < 0 ? 0 : (v > 255 ? 255 : (v + 0.5) | 0);
+    if (fc) { var ac = a * N.chroma, j = i + half; if (j >= n) j -= n;
+      var cb = Cbo[i] + fc[i] * ac, cr = Cro[i] + fc[j] * ac;
+      Cbo[i] = cb < 0 ? 0 : (cb > 255 ? 255 : (cb + 0.5) | 0); Cro[i] = cr < 0 ? 0 : (cr > 255 ? 255 : (cr + 0.5) | 0); }
+    if (map) { var o = i << 2, gv = m * N.amount * 18; map[o] = map[o] + gv * 0.9 > 255 ? 255 : map[o] + gv * 0.9; map[o + 1] = map[o + 1] + gv * 0.6 > 255 ? 255 : map[o + 1] + gv * 0.6; map[o + 3] = 255; }
+  }
 }
 
 // ===== Edges: take the harshness out of hard transitions (halos, razor steps, colour fringes) without blurring the image. =====
@@ -1124,34 +1084,18 @@ function stage1(src, w, h, p, out) {
   }
 }
 // Full pipeline: stage1 -> bake -> regrain (+ optional RGBA preview, grain map). orig: the untouched original's RGBA, or null.
-function processImage(src, w, h, p, out, ctx, orig) {
+function processImage(src, w, h, p, out, ctx) {
   var n = w * h, k, rgba = out.rgba, Yo = out.Y, Cbo = out.Cb, Cro = out.Cr;
   stage1(src, w, h, p, out);
   var edgesOn = p.edges && p.edges.on;
-  if (edgesOn) { p.edges.key = JSON.stringify([p.r, p.g, p.b, p.edge, p.bilinear, p.luma, p.chroma, p.invert]); if (ctx) { ctx.edgeCache = ctx.edgeCache || {}; ctx.edgeCacheO = ctx.edgeCacheO || {}; } }
+  if (edgesOn) { p.edges.key = JSON.stringify([p.r, p.g, p.b, p.edge, p.bilinear, p.luma, p.chroma, p.invert]); if (ctx) ctx.edgeCache = ctx.edgeCache || {}; }
   out.edgeStats = edgesOn ? edgeStage(out, w, h, p.edges, out.emap || null, ctx ? ctx.edgeCache : null) : null;
   if (!edgesOn && out.emap) { var em = out.emap; for (k = 0; k < em.length; k += 4) { em[k] = 0; em[k + 1] = 0; em[k + 2] = 0; em[k + 3] = 255; } }
-  if (p.bake && p.bake.on && ctx) {
-    var origOut = null;
-    if (orig && p.bake.seam && ctx.mask) {
-      var okey = JSON.stringify([p.r, p.g, p.b, p.edge, p.bilinear, p.luma, p.chroma, p.invert, edgesOn ? [p.edges.strength, p.edges.radius, p.edges.dehalo, p.edges.soften, p.edges.chroma, p.edges.align, p.edges.tol] : 0]);
-      if (ctx.origCache && ctx.origCache.key === okey && ctx.origCache.orig === orig) origOut = ctx.origCache.out;
-      else {
-        origOut = { Y: new Uint8Array(n), Cb: new Uint8Array(n), Cr: new Uint8Array(n) }; stage1(orig, w, h, p, origOut);
-        if (edgesOn) {   // the original uses the edited image's edge map: identical outside the edit, which is where it is used
-          ctx.edgeCacheO = ctx.edgeCacheO || {}; var eo = {}; for (var ek in p.edges) eo[ek] = p.edges[ek];
-          eo.sharedCore = ctx.edgeCache && ctx.edgeCache.data ? ctx.edgeCache.data.core : null; eo.key = p.edges.key + '/orig';
-          edgeStage(origOut, w, h, eo, null, ctx.edgeCacheO);
-        }
-        ctx.origCache = { key: okey, orig: orig, out: origOut, low: {} };
-      }
-      origOut.lowCache = ctx.origCache.low;
-    }
-    bakeApply(out, origOut, w, h, p.bake, ctx);
-  }
+  if (p.bake && p.bake.on && ctx) bakeApply(out, w, h, p.bake, ctx);
   var grained = false;
   if (p.regrain && p.regrain.mode !== 'off' && ctx && ctx.prof) grained = regrainApply(out, w, h, p.regrain, ctx);
   if (out.map && !grained) { var mp = out.map; for (k = 0; k < mp.length; k += 4) { mp[k] = 0; mp[k + 1] = 0; mp[k + 2] = 0; mp[k + 3] = 255; } }
+  if (p.patches && p.patches.amount > 0.05 && ctx) noisePatches(out, w, h, p.patches, ctx);
   if (rgba) {
     for (k = 0; k < n; k++) {
       var o = k << 2, Y1 = Yo[k], cbd = Cbo[k] - 128, crd = Cro[k] - 128;
@@ -1179,20 +1123,18 @@ function planesOf(rgba, n) {
 
 <script type="text/plain" id="worker-code">
 // ===== Worker body: full-resolution processing, encoding and measurement. =====
-var W = 0, H = 0, src = null, orig = null, planes = null, planesSeq = -1, lastDecoded = null, grainCtx = null;
+var W = 0, H = 0, src = null, planes = null, planesSeq = -1, lastDecoded = null, grainCtx = null;
 function now() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
 function analyzeBake() {
-  var t = now(), pl = planesOf(src, W * H);
-  grainCtx.mask = editMask(src, orig, W, H, grainCtx.prof);
-  var info = bakeAnalyze(pl, grainCtx.mask, W, H);
-  info.hasOrig = !!orig;
-  postMessage({ type: 'bake', info: info, ms: now() - t });
+  var t = now(), info = bakeAnalyze(planesOf(src, W * H), W, H);
+  grainCtx.bakeA = info;
+  postMessage({ type: 'bake', info: { sMed: info.sMed, nEdges: info.nEdges, sharpFrac: info.sharpFrac, sigMax: info.sigMax, crushB: info.crushB, clipW: info.clipW, lift: info.lift, roll: info.roll }, ms: now() - t });
 }
 onmessage = function (e) {
   var m = e.data;
   try {
     if (m.type === 'image') {
-      W = m.w; H = m.h; src = new Uint8ClampedArray(m.rgba); orig = null; planes = null; planesSeq = -1; lastDecoded = null;
+      W = m.w; H = m.h; src = new Uint8ClampedArray(m.rgba); planes = null; planesSeq = -1; lastDecoded = null;
       var t = now(), pl = planesOf(src, W * H), prof = grainAnalyze(pl.Y, pl.Cb, pl.Cr, W, H);
       grainCtx = { prof: prof, noise: {} };
       postMessage({ type: 'grain', prof: prof, ms: now() - t });
@@ -1203,16 +1145,15 @@ onmessage = function (e) {
       var pn = W * H, po = { Y: new Uint8Array(pn), Cb: new Uint8Array(pn), Cr: new Uint8Array(pn), rgba: new Uint8ClampedArray(pn * 4),
         map: m.wantMap ? new Uint8ClampedArray(pn * 4) : null, emap: m.wantE ? new Uint8ClampedArray(pn * 4) : null };
       if (m.draft) { m.params.bake.on = false; m.params.regrain.mode = 'off'; }
-      var pt = now(); processImage(src, W, H, m.params, po, grainCtx, orig);
+      var pt = now(); processImage(src, W, H, m.params, po, grainCtx);
       var tr = [po.Y.buffer, po.Cb.buffer, po.Cr.buffer, po.rgba.buffer]; if (po.map) tr.push(po.map.buffer); if (po.emap) tr.push(po.emap.buffer);
       postMessage({ type: 'preview', seq: m.seq, Y: po.Y.buffer, Cb: po.Cb.buffer, Cr: po.Cr.buffer, rgba: po.rgba.buffer, map: po.map ? po.map.buffer : null, emap: po.emap ? po.emap.buffer : null, edgeStats: po.edgeStats, ms: now() - pt }, tr);
       return;
     }
-    if (m.type === 'original') { orig = m.rgba ? new Uint8ClampedArray(m.rgba) : null; if (grainCtx) { grainCtx.edgeCacheO = {}; analyzeBake(); } return; }
     if (m.type === 'roundtrip') {
       var n = W * H;
       var out = { Y: new Uint8Array(n), Cb: new Uint8Array(n), Cr: new Uint8Array(n), rgba: new Uint8ClampedArray(n * 4) };
-      var t0 = now(); processImage(src, W, H, m.params, out, grainCtx, orig); var t1 = now();
+      var t0 = now(); processImage(src, W, H, m.params, out, grainCtx); var t1 = now();
       var bytes = encodeJPEG({ width: W, height: H, Y: out.Y, Cb: out.Cb, Cr: out.Cr, quality: m.params.quality, subsample: m.params.sub });
       var t2 = now();
       var buf = bytes.slice().buffer;
@@ -1260,7 +1201,7 @@ function seamMap(dec) {
     }
   }
   // Error relative to the window's own fine detail (grain + edges): the same fingerprint gives the same ratio whatever the content.
-  var ratio = new Float32Array(ng), bw = (W + 7) >> 3, bh = (H + 7) >> 3, mw = new Float32Array(ng), mask = grainCtx && grainCtx.mask;
+  var ratio = new Float32Array(ng), bw = (W + 7) >> 3, bh = (H + 7) >> 3, mw = new Float32Array(ng), mask = null;
   for (k = 0; k < ng; k++) {
     var c = cnt[k] || 1;
     ratio[k] = (err[k] / c) / (0.15 + res[k] / c);
@@ -1272,7 +1213,10 @@ function seamMap(dec) {
   for (k = 0; k < ng; k++) { all.push(ratio[k]); if (mask) { if (mw[k] >= 0.97) inside.push(ratio[k]); else if (mw[k] <= 0.03) outside.push(ratio[k]); } }
   var medAll = median(all.slice()), mi = inside.length >= 4 ? median(inside) : 0, mo = outside.length >= 4 ? median(outside) : 0;
   var p90 = all.length ? all.slice().sort(function (a, b) { return a - b; })[Math.floor(all.length * 0.9)] : 0;
-  return { gw: gw, gh: gh, ratio: ratio, median: medAll, inside: mi, outside: mo, hasRegions: mi > 0 && mo > 0, p90: p90 };
+  // areas that respond to compression unlike the rest, in either direction (a pasted flat area changes far less, an over-sharp one far more)
+  var odd = 0, lo = medAll / 2, hi = medAll * 2;
+  for (k = 0; k < ng; k++) if (ratio[k] < lo || ratio[k] > hi) odd++;
+  return { gw: gw, gh: gh, ratio: ratio, median: medAll, inside: mi, outside: mo, hasRegions: mi > 0 && mo > 0, p90: p90, odd: ng ? odd / ng : 0 };
 }
 // Compares what a standard decoder returns (RGB) with the edit as any RGB viewer could show it.
 // An edit that leaves the RGB gamut is stored in the file but clipped on decode; that fraction is reported separately.
@@ -1333,11 +1277,11 @@ function analyze(dec, wantDiff) {
     seq: 0, editSeq: 0, busy: false, pending: false, exportWanted: false,
     chromaMode: 'cb', sub: '444', timing: null,
     gmode: 'off', seed: 1, grainInfo: null,
-    bakeOn: false, bakeInfo: null, origName: null, seam: null, seamCanvas: null,
+    bakeOn: false, bakeInfo: null, seam: null, seamCanvas: null, pseed: 1,
     invert: 'off', edgeOn: false, edgeStats: null
   };
   var DEF = { rx: 0, ry: 0, rz: 0, gx: 0, gy: 0, gz: 0, bx: 0, by: 0, bz: 0, yGain: 1, yLift: 0, yGamma: 1, cbOff: 0, cbGain: 1, crOff: 0, crGain: 1, rot: 0, quality: 95,
-    gStrength: 100, gChroma: 100, gAmount: 3, gShadows: 1.3, gHighlights: 0.6, gChromaM: 0.8, gSize: 0.8, bStrength: 100, eStrength: 60, eRadius: 1 };
+    gStrength: 100, gChroma: 100, gAmount: 3, gShadows: 1.3, gHighlights: 0.6, gChromaM: 0.8, gSize: 0.8, bStrength: 100, eStrength: 60, eRadius: 1, pAmount: 0, pSize: 120, pCoverage: 35, pChroma: 30 };
   var V = Object.assign({}, DEF);
   var MAX_PIXELS = (navigator.deviceMemory && navigator.deviceMemory <= 4) ? 4e6 : 12e6;
   var PREVIEW_MAX = 1000;
@@ -1356,7 +1300,8 @@ function analyze(dec, wantDiff) {
     grainManual: [['gAmount', 'Amount, midtones', 0, 12, 0.1, 'σ'], ['gShadows', 'Shadows', 0, 2.5, 0.05, '×'], ['gHighlights', 'Highlights', 0, 2.5, 0.05, '×'], ['gChromaM', 'Chroma grain', 0, 6, 0.1, 'σ']],
     grainShared: [['gSize', 'Grain size', 0.2, 3, 0.05, 'px']],
     bake: [['bStrength', 'Match strength', 0, 150, 1, '%']],
-    edges: [['eStrength', 'Strength', 0, 100, 1, '%'], ['eRadius', 'Radius', 0.4, 3, 0.05, 'px']]
+    edges: [['eStrength', 'Strength', 0, 100, 1, '%'], ['eRadius', 'Radius', 0.4, 3, 0.05, 'px']],
+    patches: [['pAmount', 'Amount (0 = off)', 0, 12, 0.1, 'σ'], ['pSize', 'Patch size', 20, 600, 5, 'px'], ['pCoverage', 'Coverage', 5, 100, 1, '%'], ['pChroma', 'Colour noise in patches', 0, 100, 1, '%']]
   };
   function fmt(key, v) {
     var step = inputs[key].step; var d = step >= 1 ? 0 : (step >= 0.1 ? 1 : 2);
@@ -1387,6 +1332,7 @@ function analyze(dec, wantDiff) {
     $('#grainAuto').innerHTML = SLIDERS.grainAuto.map(function (it) { return sliderHTML(it[0], it[1], it[2], it[3], it[4], it[5], it[0] === 'gChroma' ? 'var(--cb)' : 'var(--y)'); }).join('');
     $('#grainManual').innerHTML = SLIDERS.grainManual.map(function (it) { return sliderHTML(it[0], it[1], it[2], it[3], it[4], it[5], it[0] === 'gChromaM' ? 'var(--cb)' : 'var(--y)'); }).join('');
     $('#grainShared').innerHTML = SLIDERS.grainShared.map(function (it) { return sliderHTML(it[0], it[1], it[2], it[3], it[4], it[5], 'var(--accent)'); }).join('');
+    $('#patchGroup').innerHTML = SLIDERS.patches.map(function (it) { return sliderHTML(it[0], it[1], it[2], it[3], it[4], it[5], it[0] === 'pChroma' ? 'var(--cb)' : 'var(--y)'); }).join('');
     $('#edgeGroup').innerHTML = SLIDERS.edges.map(function (it) { return sliderHTML(it[0], it[1], it[2], it[3], it[4], it[5], 'var(--accent)'); }).join('');
     $('#bakeGroup').innerHTML = SLIDERS.bake.map(function (it) { return sliderHTML(it[0], it[1], it[2], it[3], it[4], it[5], 'var(--accent)'); }).join('');
     $$('input[type="range"]').forEach(function (el) {
@@ -1408,7 +1354,7 @@ function analyze(dec, wantDiff) {
     $('#bakeGroup').hidden = !S.bakeOn; $('#bakeAdv').hidden = !S.bakeOn;
     if (S.bakeOn && S.gmode === 'off') setSeg('#grainSeg', 'gmode', 'auto', function (v) { S.gmode = v; applyGrainMode(); });
   }
-  ['bSoften', 'bTone', 'bChroma', 'bSeam', 'bResample'].forEach(function (id) { $('#' + id).addEventListener('change', function () { paramsChanged(); }); });
+  ['bSoften', 'bTone', 'bChroma', 'bResample'].forEach(function (id) { $('#' + id).addEventListener('change', function () { paramsChanged(); }); });
   function applyGrainMode() {
     var m = S.gmode;
     $('#grainAuto').hidden = m !== 'auto'; $('#grainManual').hidden = m !== 'manual';
@@ -1432,10 +1378,10 @@ function analyze(dec, wantDiff) {
     b.addEventListener('click', function () {
       var which = b.dataset.reset;
       var keys = which === 'rgb' ? ['rx', 'ry', 'rz', 'gx', 'gy', 'gz', 'bx', 'by', 'bz'] : which === 'luma' ? ['yGain', 'yLift', 'yGamma'] : which === 'chroma' ? ['cbOff', 'cbGain', 'crOff', 'crGain', 'rot']
-        : which === 'grain' ? ['gStrength', 'gChroma', 'gAmount', 'gShadows', 'gHighlights', 'gChromaM'] : which === 'bake' ? ['bStrength'] : which === 'edges' ? ['eStrength', 'eRadius'] : ['quality'];
+        : which === 'grain' ? ['gStrength', 'gChroma', 'gAmount', 'gShadows', 'gHighlights', 'gChromaM'] : which === 'bake' ? ['bStrength'] : which === 'grain' ? ['gStrength', 'gChroma', 'gAmount', 'gShadows', 'gHighlights', 'gChromaM', 'pAmount', 'pSize', 'pCoverage', 'pChroma'] : which === 'edges' ? ['eStrength', 'eRadius'] : ['quality'];
       if (which === 'edges') { $('#eHalo').checked = true; $('#eSoft').checked = true; $('#eChroma').checked = true; $('#eAlign').checked = false; setSeg('#edgeSeg', 'edge', 'off', function (v) { S.edgeOn = false; applyEdgeMode(); }); }
       if (which === 'luma') setSeg('#invSeg', 'inv', 'off', function (v) { S.invert = v; });
-      if (which === 'bake') { ['bSoften', 'bTone', 'bChroma', 'bSeam', 'bResample'].forEach(function (id) { $('#' + id).checked = true; }); setSeg('#bakeSeg', 'bake', 'off', function (v) { S.bakeOn = v === 'on'; applyBakeMode(); }); }
+      if (which === 'bake') { ['bSoften', 'bTone', 'bChroma', 'bResample'].forEach(function (id) { $('#' + id).checked = true; }); setSeg('#bakeSeg', 'bake', 'off', function (v) { S.bakeOn = v === 'on'; applyBakeMode(); }); }
       if (which === 'comp') $('#dest').value = 'keep';
       keys.forEach(function (k) { setVal(k, DEF[k]); });
       if (which === 'rgb') { $('#edge').value = 'clamp'; $('#sampling').value = 'bilinear'; }
@@ -1468,6 +1414,7 @@ function analyze(dec, wantDiff) {
   $('#dest').addEventListener('change', function () {
     if ($('#dest').value === 'social') { setVal('quality', 82); setSeg('#subSeg', 'sub', '420', function (v) { S.sub = v; }); paramsChanged(true); }
   });
+  $('#btnPatchSeed').addEventListener('click', function () { S.pseed++; $('#patchSeedOut').textContent = 'pattern ' + S.pseed; paramsChanged(); });
   $('#btnSeed').addEventListener('click', function () { S.seed++; $('#seedOut').textContent = 'seed ' + S.seed; paramsChanged(); });
   function snap(v) { return Math.round(v / 0.05) * 0.05; }
   seg('#zoomSeg', 'zoom', function (v) { S.zoom = v; $('#stage').classList.toggle('pan', v === '100'); draw(); });
@@ -1490,8 +1437,9 @@ function analyze(dec, wantDiff) {
         tol: 2 + 1.5 * (S.grainInfo && S.grainInfo.found ? S.grainInfo.sigmaMid : 1) },
       bake: {
         on: S.bakeOn, strength: V.bStrength / 100, soften: $('#bSoften').checked, tone: $('#bTone').checked, chromaEq: $('#bChroma').checked,
-        seam: $('#bSeam').checked, resample: $('#bResample').checked, sigma: S.bakeInfo ? S.bakeInfo.sigmaMatch : 0, seamRadius: 12, info: S.bakeInfo
+        resample: $('#bResample').checked
       },
+      patches: { amount: V.pAmount, size: V.pSize, coverage: V.pCoverage / 100, chroma: V.pChroma / 100, seed: S.pseed, grain: V.gSize },
       regrain: {
         mode: S.gmode, strength: V.gStrength / 100, size: V.gSize,
         csize: S.gmode === 'manual' ? V.gSize * 1.8 : Math.max(V.gSize, S.grainInfo ? S.grainInfo.csize : V.gSize * 1.5),
@@ -1506,7 +1454,7 @@ function analyze(dec, wantDiff) {
     [p.r, p.g, p.b].forEach(function (c) { c.dx *= s; c.dy *= s; });
     p.regrain.size *= s; p.regrain.csize *= s;
     p.edges.radius = Math.max(0.35, p.edges.radius * s);
-    p.bake.sigma *= s; p.bake.seamRadius = Math.max(2, Math.round(12 * s));
+    p.patches.size = Math.max(4, p.patches.size * s); p.patches.grain *= s;
     return p;
   }
   var fullTimer = null;
@@ -1695,66 +1643,25 @@ function analyze(dec, wantDiff) {
     ctx.putImageData(id, 0, 0);
     var v = $('#editVis'), note = $('#editVisNote');
     v.hidden = false; note.hidden = false;
-    if (sm.hasRegions) {
-      var r = sm.inside / sm.outside;
-      if (r < 1.15 && r > 0.87) { v.textContent = 'Edit visibility after compression: none'; v.className = 'verdict ok'; }
-      else if (r < 1.5 && r > 0.67) { v.textContent = 'Edit visibility after compression: faint'; v.className = 'verdict warn'; }
-      else { v.textContent = 'Edit visibility after compression: obvious'; v.className = 'verdict bad'; }
-      note.textContent = 'Edited area changes ' + r.toFixed(2) + '× as much as the rest when compressed' + (S.bakeOn ? '' : ' · turn Bake on to even it out');
-    } else {
-      var u2 = sm.median > 0 ? sm.p90 / sm.median : 1;
-      v.textContent = u2 < 1.8 ? 'Compression response: even' : (u2 < 2.6 ? 'Compression response: uneven' : 'Compression response: very uneven'); v.className = 'verdict ' + (u2 < 1.8 ? 'ok' : (u2 < 2.6 ? 'warn' : 'bad'));
-      note.textContent = 'No edited area identified, so this is overall evenness: 90th percentile is ' + u2.toFixed(1) + '× the median. Load the original to measure the edit itself.';
-    }
+    var od = sm.odd * 100;
+    v.textContent = od < 6 ? 'After compression: even, nothing stands apart' : (od < 15 ? 'After compression: some areas stand apart' : 'After compression: patchy, areas stand apart');
+    v.className = 'verdict ' + (od < 6 ? 'ok' : (od < 15 ? 'warn' : 'bad'));
+    note.textContent = od.toFixed(1) + '% of the image reacts to compression differently from the rest (more than 2× or less than ½ the typical change)' + (S.bakeOn || od < 6 ? '.' : ' · turn Bake on to even it out.');
   }
   function renderBakeRead() {
     var el = $('#bakeRead'), b = S.bakeInfo;
     if (!S.origCanvas) { el.textContent = '—'; return; }
-    if (!b) { el.textContent = 'Measuring the photo’s fingerprint…'; return; }
-    $('#origMeta').textContent = b.hasOrig ? 'Original: ' + S.origName + ' · edited area ' + Math.round(b.editFrac * 100) + '% of the image' : 'No original loaded: edited areas are guessed from where the fingerprint changes' + (b.hasMask ? ' (' + Math.round(b.editFrac * 100) + '% flagged).' : ' (none found).');
-    if (!b.hasMask) { el.textContent = 'No edited area to match. Colour resolution, resample and grain still run on the whole image.'; }
-    else {
-      var parts = [];
-      parts.push('softness: photo ' + b.sN.toFixed(1) + ' px, edit ' + b.sE.toFixed(1) + ' px' + (b.sigmaMatch >= 0.2 ? ' → soften ' + b.sigmaMatch.toFixed(1) + ' px' : (b.nE < 6 ? ' (too few edges in the edit)' : ' → no change')));
-      parts.push('colour detail: ' + b.chromaN.toFixed(2) + ' vs ' + b.chromaE.toFixed(2));
-      if (b.hasTone) parts.push('blacks: ' + b.blackN + ' vs ' + b.blackE + (b.blackN - b.blackE >= 1 ? ' → lift ' + (b.blackN - b.blackE) : '') + ' · highlight colour ' + b.sat.map(function (s) { return s.toFixed(2) + '×'; }).join(' / '));
-      el.textContent = parts.join(' · ');
-    }
-    $('#bSoftenV').textContent = b.hasMask && b.sigmaMatch >= 0.2 ? 'blur the edit by ' + b.sigmaMatch.toFixed(2) + ' px' : 'nothing to do';
-    $('#bToneV').textContent = b.hasMask && b.hasTone ? 'black ' + b.blackE + ' → ' + b.blackN + ' · white ' + b.whiteE + ' → ' + b.whiteN : 'nothing to do';
-    $('#bChromaV').textContent = 'colour/brightness detail ratio ' + b.chromaN.toFixed(2) + ' (photo) · ' + b.chromaE.toFixed(2) + ' (edit)';
-    $('#bSeamV').textContent = b.hasOrig ? 'blends over ~12 px for coarse detail, ~8 px for fine' : 'needs the original';
-    $('#bResampleV').textContent = 'uniform, softens by about half a pixel';
+    if (!b) { el.textContent = 'Measuring the image…'; return; }
+    var parts = [];
+    if (b.nEdges >= 12) parts.push('typical edge ' + b.sMed.toFixed(1) + ' px · ' + Math.round(b.sharpFrac * 100) + '% of edges are crisper' + (b.sigMax >= 0.2 ? ' → softened up to ' + b.sigMax.toFixed(1) + ' px' : ''));
+    else parts.push('too few strong edges to compare sharpness');
+    parts.push('crushed blacks ' + (b.crushB * 100).toFixed(1) + '%' + (b.lift > 0.3 ? ' → floor +' + b.lift.toFixed(0) : '') + ' · clipped whites ' + (b.clipW * 100).toFixed(1) + '%' + (b.roll > 0.3 ? ' → ceiling −' + b.roll.toFixed(0) : ''));
+    el.textContent = parts.join(' · ');
+    $('#bSoftenV').textContent = b.sigMax >= 0.2 ? 'areas crisper than ' + b.sMed.toFixed(1) + ' px get softened to it' : 'every area already matches';
+    $('#bToneV').textContent = (b.lift > 0.3 || b.roll > 0.3) ? 'soft floor +' + b.lift.toFixed(0) + ', soft ceiling −' + b.roll.toFixed(0) : 'no crushed or clipped areas';
+    $('#bChromaV').textContent = 'colour at one resolution everywhere';
+    $('#bResampleV').textContent = 'half-pixel resample, whole image';
   }
-  function loadOriginalFile(file) {
-    if (!file || (file.type && !/^image\//.test(file.type))) { setStatus('That file is not an image the browser can decode.'); return; }
-    if (!S.origCanvas) return;
-    var url = URL.createObjectURL(file), img = new Image();
-    img.onload = function () { URL.revokeObjectURL(url); loadOriginalSource(img, file.name || 'original'); };
-    img.onerror = function () { setStatus('The browser could not decode ' + (file.name || 'that file') + '.'); URL.revokeObjectURL(url); };
-    img.src = url;
-  }
-  function loadOriginalSource(img, name) {
-    {
-      var oc = document.createElement('canvas'); oc.width = S.W; oc.height = S.H;
-      var octx = oc.getContext('2d', { willReadFrequently: true }); octx.fillStyle = '#ffffff'; octx.fillRect(0, 0, S.W, S.H); octx.imageSmoothingQuality = 'high'; octx.drawImage(img, 0, 0, S.W, S.H);
-      var full = octx.getImageData(0, 0, S.W, S.H);
-      S.origName = name;
-      var pv = S.pv, pc = document.createElement('canvas'); pc.width = pv.w; pc.height = pv.h;
-      var pctx = pc.getContext('2d', { willReadFrequently: true }); pctx.imageSmoothingQuality = 'high'; pctx.drawImage(oc, 0, 0, pv.w, pv.h);
-      pv.origRgba = pctx.getImageData(0, 0, pv.w, pv.h).data;
-      pworker.postMessage({ type: 'original', rgba: pv.origRgba.slice().buffer });
-      worker.postMessage({ type: 'original', rgba: full.data.buffer }, [full.data.buffer]);
-      S.bakeInfo = null; renderBakeRead();
-      if (!S.bakeOn) setSeg('#bakeSeg', 'bake', 'on', function (v) { S.bakeOn = true; applyBakeMode(); });
-      paramsChanged();
-    }
-  }
-  var origInput = document.createElement('input'); origInput.type = 'file'; origInput.accept = 'image/*'; origInput.hidden = true; document.body.appendChild(origInput);
-  origInput.addEventListener('change', function (e) { if (e.target.files[0]) loadOriginalFile(e.target.files[0]); e.target.value = ''; });
-  $('#btnOrig').addEventListener('click', function (e) { e.stopPropagation(); origInput.click(); });
-  $('#origDrop').addEventListener('drop', function (e) { e.preventDefault(); e.stopPropagation(); $('#dropHint').hidden = true; var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if (f) loadOriginalFile(f); });
-  $('#origDrop').addEventListener('dragover', function (e) { e.preventDefault(); e.stopPropagation(); });
 
   // ---------- regrain readout & profile chart ----------
   function renderGrainRead() {
@@ -1924,10 +1831,9 @@ function analyze(dec, wantDiff) {
       Y: new Uint8Array(pw * ph), Cb: new Uint8Array(pw * ph), Cr: new Uint8Array(pw * ph),
       mapCanvas: mc, mapCtx: mctx, mapData: mctx.createImageData(pw, ph),
       emapCanvas: ec, emapCtx: ectx, emapData: ectx.createImageData(pw, ph),
-      origRgba: null };
+      };
     S.grainInfo = null; renderGrainRead(); drawGrainChart();
-    S.bakeInfo = null; S.origName = null; S.seam = null; S.seamCanvas = null; $('#editVis').hidden = true; $('#editVisNote').hidden = true;
-    $('#origMeta').textContent = 'No original loaded: edited areas are guessed from where the fingerprint changes.'; renderBakeRead();
+    S.bakeInfo = null; S.seam = null; S.seamCanvas = null; $('#editVis').hidden = true; $('#editVisNote').hidden = true; renderBakeRead();
     S.editedFull = null; S.editedSeq = -1; S.decCanvas = null; S.decSeq = -1; S.diffRaw = null; S.diffCanvas = null; S.jpeg = null; S.jpegSeq = -1; S.metrics = null; S.metricsSeq = -1; S.stress = null; S.timing = null;
     S.pan = { x: 0, y: 0 };
     $('#fileMeta').textContent = name + ' · ' + w + '×' + h + (scale < 1 ? ' → scaled to ' + W + '×' + H : '') + ' · ' + ((W * H) / 1e6).toFixed(2) + ' MP';
@@ -1999,7 +1905,7 @@ function analyze(dec, wantDiff) {
     g.fillStyle = '#ffffff'; g.font = '600 22px "IBM Plex Sans Condensed", "Arial Narrow", sans-serif'; g.fillText('PASTED', 996, 680);
     return { edited: c, original: oc };
   }
-  function loadSample() { var s = makeSample(); loadImageSource(s.edited, 'sample'); loadOriginalSource(s.original, 'sample as shot'); }
+  function loadSample() { var s = makeSample(); loadImageSource(s.edited, 'sample'); }
   $('#btnSample').addEventListener('click', loadSample);
 
   // ---------- export ----------
