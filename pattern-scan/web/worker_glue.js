@@ -20,10 +20,41 @@ function finishStack() {
   stack = null;
   self.postMessage({ type: 'done', report: out.report }, out.transfer);
 }
+/* Removal: clean-begin, clean-measure (xN), clean-solve, clean-apply (xN). */
+var cleaning = null;
+function dedupe(list) {
+  var out = [];
+  list.forEach(function (c) {
+    var dup = out.some(function (o) {
+      return o.channel === c.channel && [1, -1].some(function (s) { return Math.abs(o.u - s * c.u) < 1e-3 && Math.abs(o.v - s * c.v) < 1e-3; });
+    });
+    if (!dup) out.push(c);
+  });
+  return out;
+}
+function cleanMessage(d) {
+  var cl = self.PatternClean;
+  if (d.type === 'clean-begin') {
+    cleaning = { carriers: dedupe(d.carriers), ms: [], plan: null };
+    self.postMessage({ type: 'ack', carriers: cleaning.carriers });
+  } else if (d.type === 'clean-measure') {
+    cleaning.ms.push(cl.measure(new Uint8ClampedArray(d.rgba), d.width, d.height, cleaning.carriers));
+    self.postMessage({ type: 'ack' });
+  } else if (d.type === 'clean-solve') {
+    cleaning.plan = cl.solve(cleaning.ms, cleaning.carriers, {});
+    cleaning.ms = null;
+    self.postMessage({ type: 'ack', plan: { carriers: cleaning.plan.carriers } });
+  } else if (d.type === 'clean-apply') {
+    var r = cl.apply(new Uint8ClampedArray(d.rgba), d.width, d.height, cleaning.plan, d.index);
+    self.postMessage({ type: 'ack', rgba: r.rgba.buffer, changed: r.changed }, [r.rgba.buffer]);
+  }
+}
 self.onmessage = function (e) {
   var d = e.data, core = self.PatternCore;
   try {
-    if (d.type === 'stack-begin') {
+    if (d.type && d.type.indexOf('clean-') === 0) {
+      cleanMessage(d);
+    } else if (d.type === 'stack-begin') {
       stack = { st: core.stackBegin(d.width, d.height), orig: d.orig, skipped: d.skipped || 0,
                 allJpeg: true, first: null, acc: [] };
       self.postMessage({ type: 'ack' });

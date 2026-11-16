@@ -435,6 +435,15 @@
       strength: `${fmt0(p.strength / LN2)}×`, peaks: p.peaks.length,
     }));
 
+    // what the remover can take out: every watermark-like pattern with its carrier waves
+    const removable = wm.map(p => ({
+      n: pats.indexOf(p) + 1, label: CATEGORIES[p.category][0], category: p.category,
+      period: peakPeriod(p.rep), angle: peakAngle(p.rep), channel: p.channel || 'Y',
+      levels: (p.measure.amplitude !== null && p.measure.amplitude !== undefined) ? p.measure.amplitude : 0,
+      shared: p.across ? (p.across.judged ? !!p.across.shared : null) : null,
+      waves: (p.peaks.filter(q => q.view === 'A').length ? p.peaks.filter(q => q.view === 'A') : [p.rep]).map(q => [q.u, q.v]),
+    }));
+
     const v = verdict(res, wm);
     const summary = [v.title + '. ' + v.text];
     if (res.stack) summary.push(`${res.stack.n} images of ${res.w}×${res.h} px were stacked (plain average and noise residuals).`);
@@ -464,7 +473,7 @@
     const report = {
       meta: { name: info.path, width: info.width, height: info.height, format: fmt, scans: res.n_scans, stack: res.stack || null },
       verdict: v, overlay, legend, summary, cards, otherCards, routine: routineRows, history: historyLines(res),
-      spectra, table, notes, shared,
+      spectra, table, notes, shared, removable,
     };
     const transfer = [overlay.data.buffer];
     for (const sh of shared) transfer.push(sh.img.data.buffer);
