@@ -29,6 +29,31 @@ The page analyses up to 1024 px per side by default (about 6 s on a laptop, long
 phone) or 2048 px on request. Larger images are read at full resolution from their
 centre, never shrunk.
 
+### Several images: stacking
+
+Choose several images of the same pixel size and the page stacks them instead of
+analysing one. Each picture's own content is different, so it fades as images are added;
+a pattern that sits in the same place in every image keeps its full strength. Two stacks
+are made and scanned with the same tests as a single image:
+
+- **Flat-image averaging**: the plain average of the images. Best when the images are
+  already plain (white, grey, a blank frame), and it keeps wide stripes.
+- **Noise-residual stacking**: each image minus a smoothed copy of itself, averaged with
+  more weight where that image is smooth. Best for ordinary photos of different scenes.
+
+Every pattern found is then looked up in each image separately. If the images agree on
+its alignment far more than chance allows, the report says every image carries it; if
+not, it says the pattern comes from individual images. The report also shows both stacks
+as pictures, amplified.
+
+`python tests/test_stack.py` checks this on known answers: twelve different generated
+pictures sharing a +-0.8-level ripple with 30 px stripes and a +-0.1-level ripple with
+6 px stripes. One of those pictures alone shows neither; the stack finds both, measures
+their strength, and marks them as shared. Stripes present in only one of twelve pictures
+are marked as not shared, and twelve clean pictures give nothing. Ten to thirty images
+is a good number; fewer than five cannot be judged for sharing. Stacking is in the
+browser tool only, not in the Python command line.
+
 The browser version is the same analysis as the Python tool, ported line for line
 (`web/core.js`). `python tests/compare_js.py` runs both on the same pixels: on 76 test
 images they produced the same list of findings every time. To rebuild `index.html` after
@@ -160,6 +185,7 @@ web/render.js             report text and pictures for the page
 web/template.html         page layout and controls
 web/build.py              assembles index.html
 tests/compare_js.py       checks the browser core against the Python tool (needs Node.js)
+tests/test_stack.py       known-answer check of multi-image stacking (needs Node.js)
 patternscan/analyze.py    the analysis (spectra, peak finding, measurement, classification)
 patternscan/report.py     pictures and the HTML report
 patternscan/__main__.py   command line

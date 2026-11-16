@@ -57,11 +57,23 @@
     for (const p of pat.peaks) for (const c of Object.keys(p.channels)) seen.add(c);
     return ['Y', 'Cb', 'Cr'].filter(c => seen.has(c)).map(c => names[c]).join(', ');
   }
+  function acrossText(pat) {
+    const a = pat.across;
+    if (!a) return null;
+    const agree = `agreement ${a.coherence.toFixed(2)}; unrelated images would give about ${a.chance.toFixed(2)}`;
+    if (!a.judged) return `Same alignment in ${a.aligned} of ${a.n} images. At least 5 images are needed to judge whether they share it.`;
+    if (a.shared) return `Every image carries it: same alignment in ${a.aligned} of ${a.n} images (${agree}).`;
+    return `Not shared: the alignment agrees in only ${a.aligned} of ${a.n} images (${agree}). It comes from one or a few of the images.`;
+  }
   function summaryLines(res) {
     const pats = res.patterns, info = res.info, jp = res.jpeg, lines = [];
     const main = pats.filter(p => p.category !== 'trace'), traces = pats.filter(p => p.category === 'trace');
+    if (res.stack) {
+      lines.push(`${res.stack.n} images of ${res.w}\u00d7${res.h} px were stacked: averaged directly, and as noise residuals. Each picture's own content fades in the stack; whatever all of them carry stays.`);
+    }
     if (!pats.length) {
-      lines.push('No repeating pattern stands out from the picture\'s own detail at any frequency, in brightness or colour.');
+      lines.push(res.stack ? 'Nothing repeating survives the stack: the images share no regular pattern that stands out at any frequency.'
+        : 'No repeating pattern stands out from the picture\'s own detail at any frequency, in brightness or colour.');
     } else {
       const n = main.length;
       lines.push(`${n} repeating pattern${n !== 1 ? 's' : ''} found`
@@ -73,6 +85,7 @@
       if (amp !== null && amp !== undefined && !LATTICE_CATS.includes(p.category)) bit += `, ±${amp.toFixed(1)} levels`;
       if (p.category === 'jpeg_grid' || p.category === 'chroma_grid') bit += '.';
       else bit += p.measure.is_global ? ', whole frame.' : ', part of the frame.';
+      if (p.across && p.across.judged) bit += p.across.shared ? ' Shared by all the images.' : ' Not shared by the images.';
       lines.push(bit);
     }
     if (info.is_jpeg) {
@@ -276,9 +289,9 @@
       cards.push({
         n: i + 1, label, color: col, explain: EXPLAIN[pat.category], notes: pat.notes,
         fields: [['Repeats every', periodText(pat)], ['Direction', directionText(pat)],
-                 ['Strength', strengthText(pat)], ['Where', whereText(pat)],
+                 ['Strength', strengthText(pat)]].concat(acrossText(pat) ? [['Across images', acrossText(pat)]] : []).concat([['Where', whereText(pat)],
                  ['Found in', channelsText(pat)], ['Confidence', confidenceText(pat, res.thr)],
-                 ['Spectral peaks', String(pat.peaks.length)]],
+                 ['Spectral peaks', String(pat.peaks.length)]]),
         where, zoomLeft: zp.left, zoomRight: zp.right,
         zoomCaption: `Zoom on a ${zp.size}×${zp.size}-pixel patch at (${zp.x0}, ${zp.y0}), shown ${ZOOM}×. Left: the picture${zp.grid ? ' with the block grid drawn in' : ''}. Right: ${kind} ${zp.gain.toFixed(0)}×.`,
       });
@@ -297,10 +310,36 @@
       }
     }
 
+    // what the stack itself looks like: the two classic pictures
+    const shared = [];
+    if (res.stack && res.stackRes) {
+      const cw = Math.min(res.w, MAX_DISPLAY), ch = Math.min(res.h, MAX_DISPLAY);
+      const x0 = (res.w - cw) >> 1, y0 = (res.h - ch) >> 1;
+      const panel = (a, title, text) => {
+        const crop = new Float64Array(cw * ch);
+        for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) crop[y * cw + x] = a[(y + y0) * res.w + x + x0];
+        const top = percentile(Float64Array.from(crop, Math.abs), 99) || 1e-9;
+        const gain = 110 / top, data = new Uint8ClampedArray(cw * ch * 4);
+        for (let i = 0; i < cw * ch; i++) {
+          const g = u8(128 + crop[i] * gain);
+          data[i * 4] = g; data[i * 4 + 1] = g; data[i * 4 + 2] = g; data[i * 4 + 3] = 255;
+        }
+        shared.push({ title, img: { w: cw, h: ch, data },
+          text: `${text} Brightness differences are amplified ${gain >= 10 ? gain.toFixed(0) : gain.toFixed(1)}\u00d7.` });
+      };
+      const mY = res.chans.Y, lp = C.smooth3(mY, res.w, res.h, 31), det = new Float64Array(mY.length);
+      for (let i = 0; i < det.length; i++) det[i] = mY[i] - lp[i];
+      panel(res.stackRes.res.Y, 'Stacked noise residual',
+        `Each image minus a smoothed copy of itself, averaged over all ${res.stack.n} images with more weight where an image is smooth. The pictures cancel; a pattern they share does not. An even grey field means they share nothing fine.`);
+      panel(det, 'Average of the images',
+        `The plain average of all ${res.stack.n} images with slow shading removed (flat-image averaging). On flat or plain images this shows a shared pattern directly, including wide stripes the residual cannot hold.`);
+    }
+
     const table = pats.map((p, i) => ({
       n: i + 1, cause: CATEGORIES[p.category][0], repeat: periodText(p), angle: `${peakAngle(p.rep).toFixed(0)}°`,
       levels: (p.measure.amplitude !== null && p.measure.amplitude !== undefined) ? p.measure.amplitude.toFixed(2) : '–',
       extent: (p.measure.is_global || p.category === 'jpeg_grid' || p.category === 'chroma_grid') ? 'whole' : 'part',
+      shared: p.across ? (p.across.judged ? (p.across.shared ? 'yes' : 'no') : '?') : null,
       strength: `${fmt0(p.strength / LN2)}×`, peaks: p.peaks.length,
     }));
 
@@ -310,10 +349,12 @@
 
     const fmt = info.format + (info.jpeg_quality ? `, quality ≈ ${info.jpeg_quality}` : '');
     const report = {
-      meta: { name: info.path, width: info.width, height: info.height, format: fmt, scans: res.n_scans },
-      overlay, legend, summary: summaryLines(res), cards, history: historyLines(res), spectra, table, notes,
+      meta: { name: info.path, width: info.width, height: info.height, format: fmt, scans: res.n_scans,
+              stack: res.stack || null },
+      overlay, legend, summary: summaryLines(res), cards, history: historyLines(res), spectra, table, notes, shared,
     };
     const transfer = [overlay.data.buffer];
+    for (const sh of shared) transfer.push(sh.img.data.buffer);
     for (const c of cards) transfer.push(c.where.data.buffer, c.zoomLeft.data.buffer, c.zoomRight.data.buffer);
     for (const s of spectra) transfer.push(s.img.data.buffer);
     return { report, transfer };

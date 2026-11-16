@@ -85,14 +85,14 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
 <main>
 <header>
   <h1>Pattern Scan</h1>
-  <p class="lede">Finds repeating patterns in an image at every stripe width and direction, draws them on the picture, and says what each one most likely is: JPEG blocks, a resize trace, a faint overlay, or real texture.</p>
+  <p class="lede">Finds repeating patterns in an image at every stripe width and direction, draws them on the picture, and says what each one most likely is: JPEG blocks, a resize trace, a faint overlay, or real texture. Give it several images and it stacks them to bring out a pattern they all carry.</p>
 </header>
 
 <div class="pick" id="pick">
   <div class="pick-row">
-    <input class="visually-hidden" type="file" id="file" accept="image/*">
-    <label class="btn" for="file" id="file-label">Choose an image</label>
-    <span class="hint">or drop or paste one here. It stays on your device; nothing is uploaded.</span>
+    <input class="visually-hidden" type="file" id="file" accept="image/*" multiple>
+    <label class="btn" for="file" id="file-label">Choose image(s)</label>
+    <span class="hint">One image to analyse it. Several of the same size to stack them and find what they share. Nothing is uploaded.</span>
   </div>
   <div class="pick-row">
     <label class="size" for="size">Analyse up to
@@ -180,41 +180,115 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
     return viaImg();
   }
 
-  function analyse(blob, name, isSample) {
-    if (busy) return;
-    busy = true;
-    $('error').classList.remove('on');
-    setStatus('Reading the image', 0.02);
-    var maxSide = parseInt($('size').value, 10) || 1024;
-    var headP = blob.slice(0, 1048576).arrayBuffer();
-    Promise.all([decode(blob), headP]).then(function (r) {
-      var bmp = r[0], head = r[1];
-      var W = bmp.width || bmp.naturalWidth, H = bmp.height || bmp.naturalHeight;
-      if (!W || !H) throw new Error('decode');
-      // central region at 1:1, kept on the 16-pixel grid so block patterns stay aligned
-      var cw = Math.min(W, maxSide), ch = Math.min(H, maxSide);
-      var x0 = W > maxSide ? Math.floor(Math.floor((W - cw) / 2) / 16) * 16 : 0;
-      var y0 = H > maxSide ? Math.floor(Math.floor((H - ch) / 2) / 16) * 16 : 0;
-      var cv = document.createElement('canvas');
-      cv.width = cw; cv.height = ch;
-      var ctx = cv.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' });
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(bmp, x0, y0, cw, ch, 0, 0, cw, ch);
-      var data = ctx.getImageData(0, 0, cw, ch).data;
-      if (bmp.close) bmp.close();
+  // one request to the worker; resolves with its next answer (progress is shown as it comes)
+  function ask(msg, transfer) {
+    return new Promise(function (resolve, reject) {
       var w = getWorker();
       w.onmessage = function (e) {
         var m = e.data;
         if (m.type === 'progress') setStatus(m.msg, m.frac);
-        else if (m.type === 'error') fail(m.message);
-        else if (m.type === 'done') { busy = false; $('status').classList.remove('on'); show(m.report, isSample); }
+        else if (m.type === 'error') reject(new Error(m.message));
+        else resolve(m);
       };
-      w.onerror = function (e) { fail('The analysis stopped unexpectedly' + (e && e.message ? ': ' + e.message : '.') + ' Try the 1024 px setting.'); worker = null; };
-      w.postMessage({ rgba: data.buffer, width: cw, height: ch, head: head, name: name, maxSide: maxSide,
-                      orig: { width: W, height: H, x0: x0, y0: y0 } }, [data.buffer, head]);
-    }).catch(function () {
-      fail('This file could not be read as an image. PNG, JPEG, WebP and GIF work in every browser; HEIC and TIFF only in some.');
+      w.onerror = function (e) {
+        worker = null;
+        reject(new Error('The analysis stopped unexpectedly' + (e && e.message ? ': ' + e.message : '.') + ' Try the 1024 px setting.'));
+      };
+      w.postMessage(msg, transfer || []);
     });
+  }
+
+  // central region at 1:1, kept on the 16-pixel grid so block patterns stay aligned
+  function cropRect(W, H, maxSide) {
+    var cw = Math.min(W, maxSide), ch = Math.min(H, maxSide);
+    return { cw: cw, ch: ch,
+             x0: W > maxSide ? Math.floor(Math.floor((W - cw) / 2) / 16) * 16 : 0,
+             y0: H > maxSide ? Math.floor(Math.floor((H - ch) / 2) / 16) * 16 : 0 };
+  }
+  function sizeOf(bmp) { return { W: bmp.width || bmp.naturalWidth, H: bmp.height || bmp.naturalHeight }; }
+  function pixelsOf(bmp, maxSide) {
+    var d = sizeOf(bmp);
+    if (!d.W || !d.H) throw new Error('decode');
+    var r = cropRect(d.W, d.H, maxSide);
+    var cv = document.createElement('canvas');
+    cv.width = r.cw; cv.height = r.ch;
+    var ctx = cv.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' });
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(bmp, r.x0, r.y0, r.cw, r.ch, 0, 0, r.cw, r.ch);
+    var data = ctx.getImageData(0, 0, r.cw, r.ch).data;
+    if (bmp.close) bmp.close();
+    return { data: data, W: d.W, H: d.H, r: r };
+  }
+  var UNREADABLE = 'This file could not be read as an image. PNG, JPEG, WebP and GIF work in every browser; HEIC and TIFF only in some.';
+  function begin() {
+    if (busy) return false;
+    busy = true;
+    $('error').classList.remove('on');
+    return true;
+  }
+  function finish(report, isSample) { busy = false; $('status').classList.remove('on'); show(report, isSample); }
+
+  function analyse(blob, name, isSample) {
+    if (!begin()) return;
+    setStatus('Reading the image', 0.02);
+    var maxSide = parseInt($('size').value, 10) || 1024;
+    Promise.all([decode(blob), blob.slice(0, 1048576).arrayBuffer()]).then(function (r) {
+      var px;
+      try { px = pixelsOf(r[0], maxSide); } catch (e) { throw new Error(UNREADABLE); }
+      return ask({ rgba: px.data.buffer, width: px.r.cw, height: px.r.ch, head: r[1], name: name,
+                   orig: { width: px.W, height: px.H, x0: px.r.x0, y0: px.r.y0 } }, [px.data.buffer, r[1]]);
+    }, function () { throw new Error(UNREADABLE); })
+      .then(function (m) { finish(m.report, isSample); })
+      .catch(function (err) { fail(err.message || String(err)); });
+  }
+
+  // several images: flat-image averaging and noise-residual stacking
+  function analyseStack(files) {
+    if (!begin()) return;
+    var maxSide = parseInt($('size').value, 10) || 1024;
+    var n = files.length, sizes = [], group, orig, rect;
+    var each = function (list, fn) {       // run fn on each item, one after another
+      return list.reduce(function (p, item, i) { return p.then(function () { return fn(item, i); }); }, Promise.resolve());
+    };
+    each(files, function (f, i) {
+      setStatus('Checking sizes (' + (i + 1) + ' of ' + n + ')', 0.05 * (i + 1) / n);
+      return decode(f).then(function (bmp) { var d = sizeOf(bmp); if (bmp.close) bmp.close(); sizes[i] = d.W + 'x' + d.H; },
+                            function () { sizes[i] = null; });
+    }).then(function () {
+      var count = {}, best = null;
+      sizes.forEach(function (k) { if (k) { count[k] = (count[k] || 0) + 1; if (!best || count[k] > count[best]) best = k; } });
+      if (!best) throw new Error(UNREADABLE);
+      group = files.filter(function (f, i) { return sizes[i] === best; });
+      if (group.length < 2) throw new Error('Stacking needs at least two images of the same pixel size. These are all different sizes; choose one image to analyse it alone.');
+      var wh = best.split('x').map(Number);
+      rect = cropRect(wh[0], wh[1], maxSide);
+      orig = { width: wh[0], height: wh[1], x0: rect.x0, y0: rect.y0 };
+      return ask({ type: 'stack-begin', width: rect.cw, height: rect.ch, orig: orig, skipped: n - group.length });
+    }).then(function () {
+      return each(group, function (f, i) {
+        setStatus('Stacking image ' + (i + 1) + ' of ' + group.length, 0.05 + 0.35 * (i + 1) / group.length);
+        return Promise.all([decode(f), f.slice(0, 1048576).arrayBuffer()]).then(function (r) {
+          var px = pixelsOf(r[0], maxSide);
+          return ask({ type: 'stack-add', rgba: px.data.buffer, head: r[1], name: f.name }, [px.data.buffer, r[1]]);
+        });
+      });
+    }).then(function () {
+      setStatus('Scanning the stack', 0.4);
+      return ask({ type: 'stack-analyse' });
+    }).then(function (m) {
+      if (m.type === 'done') return m;
+      return each(group, function (f, i) {
+        setStatus('Checking each image for the patterns (' + (i + 1) + ' of ' + group.length + ')', 0.75 + 0.15 * (i + 1) / group.length);
+        return decode(f).then(function (bmp) {
+          var px = pixelsOf(bmp, maxSide);
+          return ask({ type: 'coh-add', rgba: px.data.buffer }, [px.data.buffer]);
+        });
+      }).then(function () { return ask({ type: 'stack-finish' }); });
+    }).then(function (m) { finish(m.report, false); })
+      .catch(function (err) {
+        var msg = (err && err.message) || '';
+        fail(/^(The |This |Stacking)/.test(msg) ? msg : UNREADABLE);
+      });
   }
 
   function show(rep, isSample) {
@@ -225,14 +299,21 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
     meta.appendChild(document.createTextNode(rep.meta.name + ' · ' + rep.meta.width + '×' + rep.meta.height + ' px · ' + rep.meta.format));
     if (isSample) meta.appendChild(document.createTextNode(' · a generated picture with a faint ripple, stripes in one area and JPEG compression. Choose your own image to replace it.'));
 
+    var isStack = !!rep.meta.stack;
     var top = el('section', null, [
       meta,
-      figure(canvasOf(rep.overlay), 'The image, muted, with each pattern drawn over it in its colour and amplified so it can be seen. Stripes too fine for this view are shown as a glow where they occur.'),
+      figure(canvasOf(rep.overlay), (isStack ? 'The average of the images' : 'The image') + ', muted, with each pattern drawn over it in its colour and amplified so it can be seen. Stripes too fine for this view are shown as a glow where they occur.'),
       el('ul', { 'class': 'legend' }, rep.legend.map(function (l) {
         return el('li', null, [el('span', { 'class': 'chip', style: 'background:' + rgb(l[1]) }), document.createTextNode(l[0])]);
       }))
     ]);
     root.appendChild(top);
+
+    if (rep.shared && rep.shared.length) {
+      var ssec = el('section', null, [el('h2', { text: 'What the images share' })]);
+      rep.shared.forEach(function (sh) { ssec.appendChild(figure(canvasOf(sh.img, 'pix'), sh.title + '. ' + sh.text)); });
+      root.appendChild(ssec);
+    }
 
     lastSummary = rep.summary.join('\n');
     var copy = el('button', { 'class': 'btn ghost', type: 'button', id: 'copy', text: 'Copy summary' });
@@ -274,10 +355,14 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
 
     if (rep.table.length) {
       var t = el('table');
-      t.appendChild(el('thead', null, [el('tr', null, ['#', 'Cause', 'Repeat', 'Angle', '±Levels', 'Extent', 'Strength', 'Peaks'].map(function (h) { return el('th', { text: h }); }))]));
+      var heads = ['#', 'Cause', 'Repeat', 'Angle', '±Levels', 'Extent', 'Strength', 'Peaks'];
+      if (isStack) heads.splice(6, 0, 'In all images');
+      t.appendChild(el('thead', null, [el('tr', null, heads.map(function (h) { return el('th', { text: h }); }))]));
       var tb = el('tbody');
       rep.table.forEach(function (r) {
-        tb.appendChild(el('tr', null, [r.n, r.cause, r.repeat, r.angle, r.levels, r.extent, r.strength, r.peaks].map(function (v) { return el('td', { text: String(v) }); })));
+        var cells = [r.n, r.cause, r.repeat, r.angle, r.levels, r.extent, r.strength, r.peaks];
+        if (isStack) cells.splice(6, 0, r.shared || '?');
+        tb.appendChild(el('tr', null, cells.map(function (v) { return el('td', { text: String(v) }); })));
       });
       t.appendChild(tb);
       root.appendChild(el('section', null, [el('h2', { text: 'All patterns' }), el('div', { 'class': 'scroll' }, [t])]));
@@ -289,18 +374,28 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
       'Whole frame means the pattern has the same strength and alignment in every zone quiet enough to measure. Real subjects such as fabric and fences fail that test; overlays and processing pass it.',
       'One image has limits: a very faint or very slow ripple can hide under busy detail, and a cause is named from the pattern’s geometry, which cannot prove who or what put it there.',
       'Use the original file. A screenshot or a copy re-saved by a chat app has different pixels.'
-    ].concat(rep.notes);
+    ];
+    if (isStack) how = [
+      'Stacking works on what the images have in common. Each picture is different, so its content shrinks as more images are added; a pattern in the same place in every image keeps its full strength.',
+      'Two stacks are made: the plain average of the images (flat-image averaging) and the average of their noise residuals. Both are scanned at every frequency, with the same tests as for one image.',
+      'Each pattern is then looked up in every image separately. If the images agree on its alignment far more than chance allows, it is marked as shared; if not, it comes from individual images.',
+      'Use images of the same pixel size, of different scenes, straight from the same source. Ten to thirty is a good number. Images that are already plain (a white or grey frame) show a shared pattern most directly.'
+    ].concat(how.slice(1));
+    how = how.concat(rep.notes);
     root.appendChild(el('section', null, [el('h2', { text: 'How to read this' }), list(how)]));
   }
 
   function fromFile(f) { if (f) analyse(f, f.name || 'pasted image', false); }
-  $('file').addEventListener('change', function () { fromFile(this.files && this.files[0]); this.value = ''; });
+  function fromFiles(list) {
+    var files = Array.prototype.slice.call(list || []).filter(function (f) { return f; });
+    if (files.length > 1) analyseStack(files); else fromFile(files[0]);
+  }
+  $('file').addEventListener('change', function () { fromFiles(this.files); this.value = ''; });
   var pick = $('pick');
   ['dragenter', 'dragover'].forEach(function (t) { window.addEventListener(t, function (e) { e.preventDefault(); pick.classList.add('over'); }); });
   ['dragleave', 'drop'].forEach(function (t) { window.addEventListener(t, function (e) { e.preventDefault(); pick.classList.remove('over'); }); });
   window.addEventListener('drop', function (e) {
-    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f) fromFile(f);
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) fromFiles(e.dataTransfer.files);
   });
   window.addEventListener('paste', function (e) {
     var items = (e.clipboardData && e.clipboardData.items) || [];
