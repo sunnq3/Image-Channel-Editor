@@ -1103,7 +1103,10 @@ function analyzeChannels(L, info, opts, progress) {
   }
   let thrMax = 0;
   for (const k of Object.keys(thresholds)) thrMax = Math.max(thrMax, thresholds[k]);
-  return { info, rgb, w, h, chans, sources, weights, spectra, patterns: fin, jpeg,
+  // Added (view A) components that sit exactly on a pixel-lattice frequency. In one image
+  // they cannot be told from compression; a stack of images can tell (promoteSharedLattice).
+  const latticeCands = latA.filter(q => q.lattice).map(q => ({ rep: q, channel: bestChannel(q), measure: cache.get(q) }));
+  return { info, rgb, w, h, chans, sources, weights, spectra, patterns: fin, jpeg, latticeCands,
            thr: thrMax, n_scans: total, n_peaks: peaks.length, dropped, droppedInfo };
 }
 
@@ -1234,7 +1237,63 @@ function coherenceFinish(patterns, acc) {
   });
 }
 
+/* Compression blocks differ from picture to picture, so their added brightness averages
+   away in a stack; only their rhythm in roughness remains. An added component on a lattice
+   frequency that keeps the same alignment in every image is therefore not compression:
+   it is promoted to an overlay pattern of its own. */
+const LATTICE_OVERLAY_MIN = 0.25;       // brightness levels
+function promoteSharedLattice(res) {
+  let promoted = 0;
+  for (const c of res.latticeCands || []) {
+    const a = c.across, ms = c.measure;
+    // JPEG decoding itself leaves a fixed rounding ripple of about 0.1 level on these
+    // frequencies in every image, so only clearly stronger components are promoted.
+    if (!a || !a.shared || !ms || !ms.is_global || ms.amp_global < LATTICE_OVERLAY_MIN) continue;
+    for (const pat of res.patterns) {
+      const i = pat.peaks.indexOf(c.rep);
+      if (i >= 0 && pat.rep !== c.rep) pat.peaks.splice(i, 1);
+    }
+    if (res.patterns.some(pat => pat.rep === c.rep)) continue;      // already a pattern's main wave
+    ms.amplitude = ms.amp_global;
+    res.patterns.push({
+      category: ms.amplitude < 8 ? 'global_faint' : 'global_visible', peaks: [c.rep], strength: c.rep.score,
+      channel: c.channel, view: 'A', measure: ms, weighted: !!c.rep.weighted, rep: c.rep, across: a,
+      notes: ['It sits exactly on a ' + c.rep.lattice + '-pixel lattice frequency, where compression also leaves marks. It is listed as an overlay because every image carries it with the same alignment, which compression blocks do not do.'],
+    });
+    promoted++;
+  }
+  res.patterns.sort((x, y) => y.strength - x.strength);
+  return promoted;
+}
+
+/* Every wave of one pattern: strength and phase, measured over the whole frame. */
+function carrierInfo(res, pat, limit) {
+  const out = [];
+  const waves = pat.peaks.filter(q => q.view === 'A').sort((a, b) => b.score - a.score).slice(0, limit || 8);
+  for (const q of waves) {
+    const c = res.chans[pat.channel] ? pat.channel : 'Y';
+    const isRes = q.src === 'res' || q.src === 'resw';
+    const a = projectGlobal(res.sources[q.src + ':' + c], res.w, res.h, q.u, q.v, isRes ? null : res.weights['A:' + c]);
+    const g = isRes ? Math.max(0.1, residualGain(q.u, q.v, q.src === 'res' ? RES_BOX : RES_BOX_WIDE)) : 1;
+    out.push({ period: peakPeriod(q), angle: peakAngle(q), u: q.u, v: q.v, bx: q.bx, by: q.by,
+               amp: 2 * hyp(a[0], a[1]) / g, phase: Math.atan2(a[1], a[0]) * 180 / Math.PI,
+               times: q.score / LN2, lattice: q.lattice });
+  }
+  return out;
+}
+
+/* Strength of a pattern's main wave in each colour channel. */
+function channelAmps(res, pat) {
+  const m = pat.rep, out = {};
+  for (const c of Object.keys(res.chans)) {
+    const a = projectGlobal(res.chans[c], res.w, res.h, m.u, m.v, res.weights['A:' + c]);
+    out[c] = 2 * hyp(a[0], a[1]);
+  }
+  return out;
+}
+
 const PatternCore = {
+  promoteSharedLattice, carrierInfo, channelAmps,
   analyzeChannels, stackBegin, stackAdd, stackFinish, coherenceAdd, coherenceFinish, residualGain, projectGlobal, CFG, CATEGORIES, EXPLAIN, LN2, analyzePixels, parseFileHeader, reconstruct,
   peakPeriod, peakAngle, peakFreq, percentile, median, boxFilter, smooth3, whitenedSpectrum,
   findPeaks, measure, blockBoundaryTest, latticeOf, flatnessWeight, roughnessLap, roughnessStep };

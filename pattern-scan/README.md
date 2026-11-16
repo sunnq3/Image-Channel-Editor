@@ -21,6 +21,15 @@ for something that was added to the picture:
 
 ## Use it in a browser
 
+The browser tool is built around one question: does the image carry a watermark-like
+pattern, meaning a faint regular ripple laid over the whole frame? The report opens with
+that verdict. For each such pattern it gives the strength, the direction, where it is,
+its strength in each colour channel, a table of the carrier waves it is built from
+(stripe width, angle, strength, phase, position in the frequency map) and a picture of
+the pattern by itself with the image removed. JPEG blocks, pixel lattices and resize
+traces are still identified, so they are not mistaken for an added pattern, but they
+are folded away at the end and are not drawn on the picture.
+
 Open `index.html`. It is one self-contained file, like the editor in the repo root: choose,
 drop or paste an image and the report appears underneath. It works on a phone. The image
 never leaves the device; all the analysis runs in the page.
@@ -53,6 +62,16 @@ their strength, and marks them as shared. Stripes present in only one of twelve 
 are marked as not shared, and twelve clean pictures give nothing. Ten to thirty images
 is a good number; fewer than five cannot be judged for sharing. Stacking is in the
 browser tool only, not in the Python command line.
+
+A mark placed exactly on a 2-, 4-, 8- or 16-pixel frequency looks like compression in a
+single image. A stack separates them: compression blocks differ from picture to picture,
+so their added brightness averages away, while a placed mark keeps its alignment. Such a
+component is reported as an overlay when every image carries it and it is stronger than
+0.25 of a brightness level. Below that it stays with the compression traces, because
+decoding a JPEG leaves a fixed ripple of about 0.1 level on those frequencies by itself.
+The test covers both: a +-0.8-level ripple on the 8-pixel lattice in JPEG files is
+reported as a shared overlay next to the JPEG grid, and clean JPEG stacks at quality 50,
+85 and 95 report compression only.
 
 The browser version is the same analysis as the Python tool, ported line for line
 (`web/core.js`). `python tests/compare_js.py` runs both on the same pixels: on 76 test

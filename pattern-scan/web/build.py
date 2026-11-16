@@ -16,7 +16,7 @@ def sample_jpeg():
     """A small generated picture with three planted patterns (the page's opening example)."""
     base = synthetic_photo(11, 640, 480)
     ripple, _ = wave(base.shape, 6.3, 37, 2.0)                 # faint, whole frame
-    stripes, _ = wave(base.shape, 10.4, 100, 24.0)             # visible, one region
+    stripes, _ = wave(base.shape, 10.4, 100, 24.0)             # visible, one region (a "fence")
     mask = np.zeros(base.shape[:2])
     mask[250:430, 370:600] = 1
     mask = np.asarray(Image.fromarray((mask * 255).astype(np.uint8)).filter(

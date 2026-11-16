@@ -10,7 +10,8 @@ function fail(err) {
   stack = null;
 }
 function finishStack() {
-  self.PatternCore.coherenceFinish(stack.res.patterns, stack.acc);
+  self.PatternCore.coherenceFinish(stack.list, stack.acc);
+  self.PatternCore.promoteSharedLattice(stack.res);
   for (var i = 0; i < stack.res.patterns.length; i++) {
     var pat = stack.res.patterns[i], a = pat.across;
     if (a && a.judged && !a.shared) pat.notes.push('The images do not agree on this one, so it is not a mark they all carry. One or a few images contain it strongly enough to show through the average.');
@@ -48,11 +49,12 @@ self.onmessage = function (e) {
       res.stack = { n: n, skipped: stack.skipped };
       res.stackRes = fin.res;
       stack.res = res;
-      if (!res.patterns.length) finishStack();
+      stack.list = res.patterns.concat(res.latticeCands);   // everything to look up in each image
+      if (!stack.list.length) finishStack();
       else self.postMessage({ type: 'need-pass2' });
     } else if (d.type === 'coh-add') {
       var L = core.stackAdd(core.stackBegin(stack.res.w, stack.res.h), new Uint8ClampedArray(d.rgba), stack.res.w, stack.res.h);
-      core.coherenceAdd(stack.res.patterns, L, stack.acc);
+      core.coherenceAdd(stack.list, L, stack.acc);
       self.postMessage({ type: 'ack' });
     } else if (d.type === 'stack-finish') {
       finishStack();

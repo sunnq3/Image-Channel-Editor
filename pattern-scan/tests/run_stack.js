@@ -14,12 +14,13 @@ for (const set of sets) {
   info.width = set.width; info.height = set.height; info.notes = [];
   if (!set.jpeg) info.is_jpeg = false;
   const res = core.analyzeChannels(fin.L, info, { res: fin.res });
-  const acc = [];
+  const acc = [], list = res.patterns.concat(res.latticeCands);
   for (const f of set.rgba) {
     const L = core.stackAdd(core.stackBegin(set.width, set.height), new Uint8ClampedArray(fs.readFileSync(f)), set.width, set.height);
-    core.coherenceAdd(res.patterns, L, acc);
+    core.coherenceAdd(list, L, acc);
   }
-  core.coherenceFinish(res.patterns, acc);
+  core.coherenceFinish(list, acc);
+  core.promoteSharedLattice(res);
   out.push({
     name: set.name, ms: Date.now() - t0, w: res.w, h: res.h, droppedInfo: res.droppedInfo,
     patterns: res.patterns.map(p => ({

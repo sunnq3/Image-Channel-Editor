@@ -75,6 +75,16 @@ table{border-collapse:collapse;font-size:.85rem;width:100%;font-variant-numeric:
 th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
 th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
 .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.verdict{border:1px solid var(--line);border-left:4px solid var(--dim);border-radius:8px;padding:14px 16px;background:var(--panel);display:flex;flex-direction:column;gap:6px}
+.verdict.found{border-left-color:#ff3278}
+.verdict-title{font:600 1.2rem/1.25 var(--body)}
+.verdict p{max-width:66ch}
+.sub{font:500 .78rem/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:6px 0}
+details.routine{border:1px solid var(--line);border-radius:8px;padding:0 14px;background:var(--panel)}
+details.routine[open]{padding-bottom:14px}
+details.routine summary{cursor:pointer;padding:12px 0;font:500 .82rem var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+details.routine summary:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+.rrow{padding:10px 0;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:4px;font-size:.92rem}
 .tag{display:inline-block;font:500 .72rem var(--mono);letter-spacing:.1em;text-transform:uppercase;
      color:#17130a;background:var(--signal);border-radius:3px;padding:3px 7px}
 @media (max-width:420px){dl{grid-template-columns:1fr;gap:0 0}dd{margin-bottom:6px}}
@@ -85,7 +95,7 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
 <main>
 <header>
   <h1>Pattern Scan</h1>
-  <p class="lede">Finds repeating patterns in an image at every stripe width and direction, draws them on the picture, and says what each one most likely is: JPEG blocks, a resize trace, a faint overlay, or real texture. Give it several images and it stacks them to bring out a pattern they all carry.</p>
+  <p class="lede">Looks for watermark-like patterns: faint regular ripples laid over a whole image. One image gets scanned at every stripe width and direction. Several images get stacked, which fades the pictures and leaves the pattern they all carry. Compression blocks and resize traces are recognised and set aside.</p>
 </header>
 
 <div class="pick" id="pick">
@@ -291,18 +301,49 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
       });
   }
 
+  function cardNode(c) {
+    var dl = el('dl');
+    c.fields.forEach(function (f) { dl.appendChild(el('dt', { text: f[0] })); dl.appendChild(el('dd', { text: f[1] })); });
+    var kids = [el('h3', { text: c.n + '. ' + c.label }), el('p', { text: c.explain })];
+    c.notes.forEach(function (n) { kids.push(el('p', { 'class': 'note', text: n })); });
+    kids.push(dl);
+    if (c.alone) kids.push(figure(canvasOf(c.alone), c.aloneCaption));
+    if (c.carriers && c.carriers.length) {
+      var t = el('table');
+      t.appendChild(el('thead', null, [el('tr', null, ['Stripe width', 'Angle', '±Levels', 'Phase', 'Frequency (cycles/px)', 'Map position', 'Strength'].map(function (h) { return el('th', { text: h }); }))]));
+      var tb = el('tbody');
+      c.carriers.forEach(function (q) {
+        tb.appendChild(el('tr', null, [q.period, q.angle, q.levels, q.phase, q.freq, q.bin, q.strength].map(function (v) { return el('td', { text: v }); })));
+      });
+      t.appendChild(tb);
+      kids.push(el('div', null, [
+        el('p', { 'class': 'sub', text: 'Carrier waves (' + c.carriers.length + ')' }),
+        el('div', { 'class': 'scroll' }, [t]),
+        el('p', { 'class': 'hint', text: 'Each row is one wave the pattern is built from. Phase is where its crests sit, measured from the top-left pixel; map position is its dot in the frequency map, counted from the centre.' })
+      ]));
+    }
+    kids.push(figure(canvasOf(c.where), 'Where it is: brighter colour means the pattern is measured more clearly there.'));
+    kids.push(figure(el('div', { 'class': 'pair' }, [canvasOf(c.zoomLeft, 'pix'), canvasOf(c.zoomRight, 'pix')]), c.zoomCaption));
+    return el('div', { 'class': 'card', style: '--c:' + rgb(c.color) }, kids);
+  }
+
   function show(rep, isSample) {
     var root = $('report');
     root.textContent = '';
+    var isStack = !!rep.meta.stack;
     var meta = el('p', { 'class': 'meta' });
     if (isSample) { meta.appendChild(el('span', { 'class': 'tag', text: 'Sample' })); meta.appendChild(document.createTextNode(' ')); }
     meta.appendChild(document.createTextNode(rep.meta.name + ' · ' + rep.meta.width + '×' + rep.meta.height + ' px · ' + rep.meta.format));
-    if (isSample) meta.appendChild(document.createTextNode(' · a generated picture with a faint ripple, stripes in one area and JPEG compression. Choose your own image to replace it.'));
+    if (isSample) meta.appendChild(document.createTextNode(' · a generated picture with a faint ripple added over the whole frame. Choose your own image to replace it.'));
 
-    var isStack = !!rep.meta.stack;
-    var top = el('section', null, [
-      meta,
-      figure(canvasOf(rep.overlay), (isStack ? 'The average of the images' : 'The image') + ', muted, with each pattern drawn over it in its colour and amplified so it can be seen. Stripes too fine for this view are shown as a glow where they occur.'),
+    var verdict = el('div', { 'class': 'verdict' + (rep.verdict.found ? ' found' : '') }, [
+      el('p', { 'class': 'verdict-title', text: rep.verdict.title }),
+      el('p', { text: rep.verdict.text })
+    ]);
+    var top = el('section', null, [meta, verdict,
+      figure(canvasOf(rep.overlay), rep.legend.length
+        ? (isStack ? 'The average of the images' : 'The image') + ', muted, with each added pattern drawn over it in its colour and amplified so it can be seen. Stripes too fine for this view are shown as a glow where they occur.'
+        : (isStack ? 'The average of the images.' : 'The image.') + ' Nothing to draw: no added pattern was found.'),
       el('ul', { 'class': 'legend' }, rep.legend.map(function (l) {
         return el('li', null, [el('span', { 'class': 'chip', style: 'background:' + rgb(l[1]) }), document.createTextNode(l[0])]);
       }))
@@ -322,24 +363,18 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
       try { navigator.clipboard.writeText(lastSummary).then(function () { done('Copied'); }, function () { done('Copy not allowed here'); }); }
       catch (e) { done('Copy not allowed here'); }
     });
-    root.appendChild(el('section', null, [el('h2', { text: 'Report' }), list(rep.summary, 'summary'), el('div', { 'class': 'actions' }, [copy])]));
+    root.appendChild(el('section', null, [el('h2', { text: 'Report' }), list(rep.summary.slice(1)), el('div', { 'class': 'actions' }, [copy])]));
 
     if (rep.cards.length) {
-      var sec = el('section', null, [el('h2', { text: 'Each pattern' })]);
-      rep.cards.forEach(function (c) {
-        var dl = el('dl');
-        c.fields.forEach(function (f) { dl.appendChild(el('dt', { text: f[0] })); dl.appendChild(el('dd', { text: f[1] })); });
-        var kids = [el('h3', { text: c.n + '. ' + c.label }), el('p', { text: c.explain })];
-        c.notes.forEach(function (n) { kids.push(el('p', { 'class': 'note', text: n })); });
-        kids.push(dl);
-        kids.push(figure(canvasOf(c.where), 'Where it is: brighter colour means the pattern is measured more clearly there.'));
-        kids.push(figure(el('div', { 'class': 'pair' }, [canvasOf(c.zoomLeft, 'pix'), canvasOf(c.zoomRight, 'pix')]), c.zoomCaption));
-        sec.appendChild(el('div', { 'class': 'card', style: '--c:' + rgb(c.color) }, kids));
-      });
+      var sec = el('section', null, [el('h2', { text: 'Watermark-like patterns' })]);
+      rep.cards.forEach(function (c) { sec.appendChild(cardNode(c)); });
       root.appendChild(sec);
     }
-
-    root.appendChild(el('section', null, [el('h2', { text: 'Compression history' }), list(rep.history)]));
+    if (rep.otherCards.length) {
+      var osec = el('section', null, [el('h2', { text: 'Repeating texture in the picture' })]);
+      rep.otherCards.forEach(function (c) { osec.appendChild(cardNode(c)); });
+      root.appendChild(osec);
+    }
 
     var fsec = el('section', null, [el('h2', { text: 'Frequency maps' })]);
     rep.spectra.forEach(function (s) {
@@ -349,9 +384,24 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
         ctx.strokeStyle = rgb(m.color);
         ctx.beginPath(); ctx.arc(m.x, m.y, Math.max(5, s.img.w / 90), 0, 2 * Math.PI); ctx.stroke();
       });
-      fsec.appendChild(figure(cv, s.title + '. ' + s.text + ' Circles mark the detected peaks in the colours above.'));
+      fsec.appendChild(figure(cv, s.title + '. ' + s.text + ' Circles mark the detected peaks.'));
     });
     root.appendChild(fsec);
+
+    // routine processing: always there, kept out of the way
+    var det = el('details', { 'class': 'routine' });
+    det.appendChild(el('summary', { text: 'Routine processing traces (' + rep.routine.length + ')' }));
+    det.appendChild(el('p', { 'class': 'hint', text: 'Compression blocks, pixel lattices and resize rhythms. Nearly every image has some. They are identified so they are not mistaken for an added pattern, and kept out of the picture above.' }));
+    rep.routine.forEach(function (r) {
+      var kids = [el('p', null, [el('span', { 'class': 'chip', style: 'background:' + rgb(r.color) }),
+        el('b', { text: r.label }), document.createTextNode(' · every ' + r.repeat + ' · ' + r.strength + ' background')]),
+        el('p', { 'class': 'hint', text: r.explain })];
+      r.notes.forEach(function (n) { kids.push(el('p', { 'class': 'hint', text: n })); });
+      det.appendChild(el('div', { 'class': 'rrow' }, kids));
+    });
+    det.appendChild(el('p', { 'class': 'sub', text: 'Compression history' }));
+    det.appendChild(list(rep.history));
+    root.appendChild(el('section', null, [det]));
 
     if (rep.table.length) {
       var t = el('table');
@@ -365,22 +415,23 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
         tb.appendChild(el('tr', null, cells.map(function (v) { return el('td', { text: String(v) }); })));
       });
       t.appendChild(tb);
-      root.appendChild(el('section', null, [el('h2', { text: 'All patterns' }), el('div', { 'class': 'scroll' }, [t])]));
+      var tdet = el('details', { 'class': 'routine' }, [el('summary', { text: 'Everything found (' + rep.table.length + ')' }), el('div', { 'class': 'scroll' }, [t])]);
+      root.appendChild(el('section', null, [tdet]));
     }
 
     var how = [
-      'Every stripe width from 2 pixels up to a third of the image, in every direction, was tested in brightness and in both colour channels: ' + rep.meta.scans + ' scans in all.',
-      'A pattern is reported only when it stands far above what the picture’s own detail produces at neighbouring frequencies. Strength is that ratio.',
-      'Whole frame means the pattern has the same strength and alignment in every zone quiet enough to measure. Real subjects such as fabric and fences fail that test; overlays and processing pass it.',
-      'One image has limits: a very faint or very slow ripple can hide under busy detail, and a cause is named from the pattern’s geometry, which cannot prove who or what put it there.',
+      'A watermark-like pattern here means a regular ripple added to the pixel values over the whole frame, with the same alignment everywhere, that compression blocks, pixel lattices and resizing do not explain.',
+      'Every stripe width from 2 pixels up to a third of the image, in every direction, was tested in brightness and in both colour channels: ' + rep.meta.scans + ' scans in all. A pattern is reported only when it stands far above what the picture’s own detail produces at neighbouring frequencies.',
+      'The tool reads geometry. It can say a ripple is there, how strong, and whether every image carries it. It cannot say who or what put it there: interference and scanner noise make whole-frame ripples too.',
+      'One image has limits: a very faint or very wide ripple can hide under busy detail. Stacking several images from the same source looks much deeper.',
       'Use the original file. A screenshot or a copy re-saved by a chat app has different pixels.'
     ];
     if (isStack) how = [
       'Stacking works on what the images have in common. Each picture is different, so its content shrinks as more images are added; a pattern in the same place in every image keeps its full strength.',
-      'Two stacks are made: the plain average of the images (flat-image averaging) and the average of their noise residuals. Both are scanned at every frequency, with the same tests as for one image.',
+      'Two stacks are made: the plain average of the images (flat-image averaging) and the average of their noise residuals. Both are scanned at every frequency.',
       'Each pattern is then looked up in every image separately. If the images agree on its alignment far more than chance allows, it is marked as shared; if not, it comes from individual images.',
       'Use images of the same pixel size, of different scenes, straight from the same source. Ten to thirty is a good number. Images that are already plain (a white or grey frame) show a shared pattern most directly.'
-    ].concat(how.slice(1));
+    ].concat([how[0], how[2], how[4]]);
     how = how.concat(rep.notes);
     root.appendChild(el('section', null, [el('h2', { text: 'How to read this' }), list(how)]));
   }

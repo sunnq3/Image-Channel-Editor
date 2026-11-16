@@ -36,15 +36,19 @@ def main():
     fine, f_fine = wave(bases[0].shape, 6.0, 20, 0.1)        # fine stripes, +-0.1 level
     lone, f_lone = wave(bases[0].shape, 9.0, 70, 20.0)       # strong, in ONE picture only
     shared = (slow + fine)[..., None]
+    # a ripple placed exactly on the 8-pixel lattice, where JPEG also leaves marks
+    yy, xx = np.mgrid[:H, :W]
+    f_lat = (0.25, 0.125)
+    onlat = (0.8 * np.sin(2 * np.pi * (f_lat[0] * xx + f_lat[1] * yy)))[..., None]
 
-    def write(name, imgs, as_jpeg=False):
+    def write(name, imgs, as_jpeg=False, quality=85):
         files, first = [], None
         for i, a in enumerate(imgs):
             im = to_img(a)
             path = os.path.join(tmp, f"{name}_{i}." + ("jpg" if as_jpeg else "png"))
             if as_jpeg:
                 with open(path, "wb") as fh:
-                    fh.write(jpeg_bytes(im, 85))
+                    fh.write(jpeg_bytes(im, quality))
             else:
                 im.save(path)
             rp = path + ".rgba"
@@ -60,6 +64,10 @@ def main():
         write("single", [bases[1] + shared]),
         write("lone", [b + (lone[..., None] if i == 3 else 0) for i, b in enumerate(bases)]),
         write("shared_jpeg", [b + shared for b in bases], as_jpeg=True),
+        write("lattice_jpeg", [b + onlat for b in bases], as_jpeg=True),
+        write("clean_jpeg", bases, as_jpeg=True),
+        write("clean_jpeg_q50", bases, as_jpeg=True, quality=50),
+        write("clean_jpeg_q95", bases, as_jpeg=True, quality=95),
     ]
     mpath = os.path.join(tmp, "m.json")
     with open(mpath, "w") as fh:
@@ -88,6 +96,12 @@ def main():
         "no other pattern in the shared stack": all(near(p, f_slow) or near(p, f_fine) for p in res["shared"]["patterns"]),
         "one-picture stripes are marked not shared": all(not p["across"]["shared"] for p in find("lone", f_lone)),
         "JPEG stack: both ripples shared": all(any(p["across"]["shared"] for p in find("shared_jpeg", f)) for f in (f_slow, f_fine)),
+        "ripple ON the 8-px lattice, in JPEGs: reported as a shared overlay": any(
+            p["category"] == "global_faint" and p["across"]["shared"] for p in find("lattice_jpeg", f_lat)),
+        "that stack still reports the JPEG grid separately": any(p["category"] == "jpeg_grid" for p in res["lattice_jpeg"]["patterns"]),
+        "clean JPEG stacks (q50, q85, q95): compression only, no overlay": all(
+            p["category"] in ("jpeg_grid", "chroma_grid", "trace")
+            for k in ("clean_jpeg", "clean_jpeg_q50", "clean_jpeg_q95") for p in res[k]["patterns"]),
         "JPEG stack: block grid reported and shared": any(p["category"] == "jpeg_grid" and p["across"]["shared"] for p in res["shared_jpeg"]["patterns"]),
     }
     print()
