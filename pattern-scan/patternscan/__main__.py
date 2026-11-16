@@ -17,6 +17,9 @@ def main(argv=None):
     ap.add_argument("image", help="image file (PNG, JPEG, WebP, TIFF, ...)")
     ap.add_argument("-o", "--out", help="report file (default: IMAGE.patterns.html)")
     ap.add_argument("--json", help="also write the findings as JSON to this file")
+    ap.add_argument("--full", action="store_true",
+                    help="analyse up to 4096 px per side instead of the central 2048 "
+                         "(several times slower)")
     args = ap.parse_args(argv)
 
     if not os.path.isfile(args.image):
@@ -24,7 +27,7 @@ def main(argv=None):
     out = args.out or os.path.splitext(args.image)[0] + ".patterns.html"
     t0 = time.time()
     try:
-        res = analyze(args.image)
+        res = analyze(args.image, full=args.full)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

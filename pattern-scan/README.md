@@ -25,6 +25,7 @@ for something that was added to the picture:
 pip install -r requirements.txt
 python -m patternscan photo.png                 # writes photo.patterns.html
 python -m patternscan photo.jpg -o report.html --json report.json
+python -m patternscan big_photo.jpg --full      # analyse more than the central 2048 px
 ```
 
 Open the HTML file in any browser. It is one self-contained file: the highlighted image,
@@ -88,12 +89,14 @@ false alarm. Thresholds were tuned on other pictures; this is the result on 12 p
 | enlarged 1.3x / 1.5x (bicubic) | 24/24 | 0 |
 | enlarged 2x (pixel doubling) | 10/12 | 1 |
 | enlarged exactly 2x (bicubic) | 12/12 | 0 |
-| rotated 7 degrees | 12/12 | 2 |
+| rotated 7 degrees | 12/12 | 0 |
 | faint ripple, then JPEG quality 85 | 24/24 | 2 |
-| **Total** | **238/240** | **8** |
+| **Total** | **238/240** | **6** |
 
 "Found" means found *and* given the right cause. In the last row both the ripple and the
-JPEG grid must be reported, each under its own name.
+JPEG grid must be reported, each under its own name. A second check on two 2048x1536
+pictures (clean, two faint ripples, regional stripes, JPEG, enlargement, ripple plus
+JPEG) gave 14/14 found and no unexpected reports.
 
 Faintest whole-frame ripple it finds (brightness levels out of 255, generated pictures):
 
@@ -104,15 +107,21 @@ Faintest whole-frame ripple it finds (brightness levels out of 255, generated pi
 | 30 px | 3 | 0.5 |
 | 60 px | 8 to 12 | 3 |
 
-Speed on two CPU cores: about 3 s for 1024x768, about 25 s for 2048x1536. Images larger
-than 4096 px on a side are analysed in their central 4096 px, at full resolution.
+On four small real photographs (300 to 640 px, the sample images shipped with
+scikit-image) the faintest ripple found was +-1 level at 5 px and +-1 to 2 levels at
+12.5 px.
+
+Speed on two CPU cores: about 3 s for 1024x768, 10 to 25 s for 2048x1536. Larger images
+are analysed in their central 2048x2048 pixels, at full resolution and never resized;
+whole-frame patterns are all there. `--full` analyses up to 4096 px per side instead
+(a 12-megapixel photo then takes about two minutes).
 
 ## Limits
 
 - **One image is weaker evidence than many.** A slow ripple (wide stripes) or one buried
-  under busy detail can be missed; the table above shows how faint is too faint. Real
-  photographs are busier than the generated test pictures, so expect less sensitivity on
-  them for stripes wider than about 10 px.
+  under busy detail can be missed; the tables above show how faint is too faint. Real
+  photographs are busier than the generated test pictures, so they need a ripple about
+  twice as strong.
 - **A cause is read from geometry.** "Faint global overlay" means a whole-frame ripple
   that JPEG, pixel lattices and resizing do not explain. It does not say who or what put
   it there.

@@ -34,7 +34,8 @@ MIN_BINS_FROM_DC = 3  # ignore patterns with fewer than 3 cycles across the imag
 MAX_PEAKS_PER_SPECTRUM = 60
 LATTICE_TOL_BINS = 1.5
 GLOBAL_SIGN_CONSISTENCY = 0.85
-MAX_ANALYSIS_SIDE = 4096
+MAX_ANALYSIS_SIDE = 2048       # default; --full raises it to FULL_ANALYSIS_SIDE
+FULL_ANALYSIS_SIDE = 4096
 
 
 # ----------------------------------------------------------------------------
@@ -66,8 +67,8 @@ def _estimate_jpeg_quality(qtable) -> int | None:
     return best
 
 
-def load_image(path):
-    """Return (channels dict, file-info dict). Pixels are never rescaled."""
+def load_image(path, max_side=MAX_ANALYSIS_SIDE):
+    """Return (channels dict, RGB array, file-info dict). Pixels are never rescaled."""
     im = Image.open(path)
     info = {
         "path": str(path),
@@ -105,15 +106,16 @@ def load_image(path):
     rgb = np.asarray(im.convert("RGB"), dtype=np.float64)
 
     h, w = rgb.shape[:2]
-    if max(h, w) > MAX_ANALYSIS_SIDE:
-        ch, cw = min(h, MAX_ANALYSIS_SIDE), min(w, MAX_ANALYSIS_SIDE)
+    if max(h, w) > max_side:
+        ch, cw = min(h, max_side), min(w, max_side)
         # keep the crop on the 16-pixel grid so block patterns stay aligned
         y0 = ((h - ch) // 2) // 16 * 16
         x0 = ((w - cw) // 2) // 16 * 16
         rgb = rgb[y0:y0 + ch, x0:x0 + cw]
         info["notes"].append(
-            f"Image is large; analysed the central {cw}x{ch} region at full resolution "
-            f"(offset {x0},{y0}).")
+            f"Image is large; analysed the central {cw}x{ch} pixels at full resolution "
+            f"(starting at {x0},{y0}). Pictures and positions in this report refer to that "
+            f"region. Run with --full to analyse up to {FULL_ANALYSIS_SIDE} px per side.")
     info["analysed_width"] = rgb.shape[1]
     info["analysed_height"] = rgb.shape[0]
 
@@ -263,7 +265,7 @@ def find_peaks(E, view, channel, P=None):
     cy, cx = h // 2, w // 2
     n_half = h * w / 2
     thr = SAFETY * math.log(n_half / ALPHA)
-    pad = 10
+    pad = 30
     Ep = np.pad(E, pad, mode="wrap")
     mx = maximum_filter(E, size=7, mode="wrap")
     cand = (E == mx) & (E > thr)
@@ -291,6 +293,24 @@ def find_peaks(E, view, channel, P=None):
         yp, xp = y + pad, x + pad
         ref = np.percentile(Ep[yp - 10:yp + 11, xp - 10:xp + 11][ring], 85)
         if E[y, x] < ISOLATION * ref:
+            continue
+        # A long straight edge in the picture puts a streak through the centre of
+        # the spectrum, and noise along a streak makes local maxima. A real
+        # pattern is a dot: it must also stand out along the line through the
+        # centre, not just from its surroundings in general.
+        ry, rx = y - cy, x - cx
+        rr = math.hypot(ry, rx)
+        along = []
+        for dist in range(5, 27, 2):
+            for sgn in (1, -1):
+                t = (rr + sgn * dist) / rr
+                if rr + sgn * dist < MIN_BINS_FROM_DC + 2:
+                    continue
+                sy = int(round(cy + ry * t)) + pad
+                sx = int(round(cx + rx * t)) + pad
+                if 1 <= sy < Ep.shape[0] - 1 and 1 <= sx < Ep.shape[1] - 1:
+                    along.append(Ep[sy - 1:sy + 2, sx - 1:sx + 2].max())
+        if len(along) >= 6 and E[y, x] < ISOLATION * 2.0 * float(np.median(along)):
             continue
         if P is not None:
             # locate on the raw power: the whitening can skew the apex slightly
@@ -640,8 +660,8 @@ def _derived_from(p, bases, w, h, lattice_step):
     return None
 
 
-def analyze(path):
-    chans, rgb, info = load_image(path)
+def analyze(path, full=False):
+    chans, rgb, info = load_image(path, FULL_ANALYSIS_SIDE if full else MAX_ANALYSIS_SIDE)
     h, w = chans["Y"].shape
     if min(h, w) < 64:
         raise ValueError("Image is too small to analyse (needs at least 64x64 pixels).")
@@ -809,12 +829,12 @@ def analyze(path):
                     pat.category = "global_faint" if ms["amplitude"] < 8.0 else "global_visible"
             else:
                 ms["amplitude"] = ms["amp_local"]
-                pat.category = "resampling" if (has_b_twin and ms["amplitude"] < 1.0) else "regional"
-            if pat.category == "regional" and ms["amplitude"] < MIN_REGIONAL_AMPLITUDE:
-                # a sub-visible rhythm confined to one spot: the staircase of a
-                # straight edge after compression or resizing, not a texture
-                dropped += 1
-                continue
+                if ms["amplitude"] < MIN_REGIONAL_AMPLITUDE:
+                    # a sub-visible rhythm confined to one spot: the staircase of a
+                    # straight edge after compression or resizing, not a texture
+                    dropped += 1
+                    continue
+                pat.category = "regional"
             if pat.category == "global_faint" and ms["amplitude"] < TRACE_AMPLITUDE:
                 pat.category = "trace"
             if pat.category == "global_faint" and on_axis:
