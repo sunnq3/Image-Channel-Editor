@@ -37,18 +37,24 @@ for (const set of sets) {
   const t0 = Date.now(), cleaned = [], reports = [];
   const read = f => new Uint8ClampedArray(fs.readFileSync(f));
   const files = set.only ? set.rgba.slice(0, set.only) : set.rgba;
-  const measured = files.map(f => clean.measure(read(f), set.width, set.height, carriers));
-  const plan = clean.solve(measured, carriers, set.opts || {});
+  const measured = carriers.length ? files.map(f => clean.measure(read(f), set.width, set.height, carriers)) : [];
+  const plan = carriers.length ? clean.solve(measured, carriers, set.opts || {}) : null;
+  let deep = null;
+  if (set.deep && files.length >= 2) {
+    const D = clean.deepBegin(set.width, set.height, set.deep);
+    files.forEach((f, i) => clean.deepAdd(D, read(f), clean.carrierCorrection(set.width, set.height, plan, i), i));
+    deep = clean.deepSolve(D, set.deepOpts || {});
+  }
   fs.mkdirSync(set.outDir, { recursive: true });
   files.forEach((f, i) => {
-    const r = clean.apply(read(f), set.width, set.height, plan, i);
+    const r = clean.finish(read(f), set.width, set.height, plan, deep, i);
     const p = path.join(set.outDir, path.basename(f) + '.clean');
     fs.writeFileSync(p, Buffer.from(r.rgba.buffer));
     cleaned.push(p); reports.push({ changed: r.changed });
   });
   const ms = (Date.now() - t0) / files.length;
   const after = files.length >= 2 ? scan(set, cleaned) : null;
-  out.push({ name: set.name, carriers, plan: plan.carriers, msPerImage: ms, cleaned, reports,
+  out.push({ name: set.name, carriers, plan: plan ? plan.carriers : [], deep: deep ? deep.stats : null, msPerImage: ms, cleaned, reports,
              before: brief(before), after: after ? brief(after) : [] });
 }
 process.stdout.write(JSON.stringify(out));

@@ -340,16 +340,18 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
       return { data: data, W: d.W, H: d.H };
     });
   }
-  function toPng(buf, W, H) {
+  // canvas encoder: JPEG (quality 0-1, no metadata) or PNG
+  function encode(buf, W, H, fmt, q) {
     var cv = document.createElement('canvas');
     cv.width = W; cv.height = H;
     cv.getContext('2d', { colorSpace: 'srgb' }).putImageData(new ImageData(new Uint8ClampedArray(buf), W, H), 0, 0);
     return new Promise(function (resolve, reject) {
-      cv.toBlob(function (b) { if (b) resolve(b); else reject(new Error('Could not write the PNG (the image may be too large for this browser).')); }, 'image/png');
+      cv.toBlob(function (b) { if (b) resolve(b); else reject(new Error('Could not write the image (it may be too large for this browser).')); },
+        fmt === 'png' ? 'image/png' : 'image/jpeg', q);
     });
   }
 
-  // a plain .zip (stored, no compression: PNGs are already compressed)
+  // a plain .zip (stored, no compression: the images are already compressed)
   var CRC = (function () {
     var t = new Uint32Array(256);
     for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
@@ -380,9 +382,9 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
     e.setUint32(12, size, true); e.setUint32(16, offset, true);
     return new Blob(parts.concat(central, [e.buffer]), { type: 'application/zip' });
   }
-  function cleanName(name) {
+  function cleanName(name, fmt) {
     var base = String(name || 'image').replace(/\.[^.\/\\]+$/, '');
-    return base + '-clean.png';
+    return base + '-clean.' + (fmt === 'png' ? 'png' : 'jpg');
   }
 
   function removeSection(rep, isStack, isSample) {
@@ -399,7 +401,8 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
         ? 'Ticked patterns are subtracted from ' + (n > 1 ? 'all ' + n + ' images' : 'the image') + ' at full resolution. '
         : 'The scan found no watermark-like pattern to take out. You can still type one in below. ') +
         'The exact frequency is found again on the full images, the ripple is measured' + (n > 1 ? ' from all of them together' : '') +
-        ' and subtracted, and the result is saved as PNG with dither so a correction smaller than one brightness step still takes effect. Real texture near the same frequency is left alone.' })
+        ' and subtracted with dither, so a correction smaller than one brightness step still takes effect. Real texture near the same frequency is left alone.' +
+        (n > 1 ? ' Deep clean also takes out anything else the images share pixel for pixel, including parts too faint to name and marks that are not ripples.' : '') })
     ]);
     var listBox = el('div', { 'class': 'rm-list' });
     function drawList() {
@@ -445,15 +448,33 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
       el('p', { 'class': 'hint', text: 'Use the Repeat and Angle columns of a Pattern Scan table. Rounded values are fine: the exact frequency is found on the images.' }),
       addRow]));
 
+    // options: deep clean, output format
+    var deepBox = el('input', { type: 'checkbox', id: 'rm-deep' });
+    deepBox.checked = n >= 2;
+    if (n < 2) deepBox.disabled = true;
+    var fmtSel = el('select', { id: 'rm-fmt' }, [
+      el('option', { value: 'jpg-100', text: 'JPG, quality 100' }), el('option', { value: 'jpg-95', text: 'JPG, quality 95' }),
+      el('option', { value: 'jpg-90', text: 'JPG, quality 90' }), el('option', { value: 'jpg-85', text: 'JPG, quality 85' }),
+      el('option', { value: 'png', text: 'PNG (lossless)' })]);
+    fmtSel.value = 'jpg-95';
+    sec.appendChild(el('div', { 'class': 'rm-list' }, [
+      el('label', { 'class': 'rm-row', 'for': 'rm-deep' }, [deepBox, el('span', { text: n >= 2
+        ? 'Deep clean: also remove everything else these ' + n + ' images share pixel for pixel (brightness and colour). Stronger with more images.'
+        : 'Deep clean needs two or more images of the same size from the same source.' })])]));
+    sec.appendChild(el('div', { 'class': 'rm-add' }, [el('label', { 'for': 'rm-fmt' }, [document.createTextNode('Save as'), fmtSel])]));
+
     var go = el('button', { type: 'button', 'class': 'btn', text: 'Remove' });
     var prog = el('div', { 'class': 'rm-prog', role: 'status', 'aria-live': 'polite' }, [el('span', { text: '' }), el('div', { 'class': 'bar' }, [el('i')])]);
     var out = el('div', { 'class': 'rm-out' });
     function updateGo() {
       var k = found.concat(manual).filter(function (r) { return r.on; }).length;
-      go.disabled = !k || !lastFiles.length;
+      var deep = deepBox.checked && n >= 2;
+      go.disabled = (!k && !deep) || !lastFiles.length;
       go.style.opacity = go.disabled ? 0.5 : 1;
-      go.textContent = k ? 'Remove ' + k + ' pattern' + (k > 1 ? 's' : '') + ' from ' + (n > 1 ? n + ' images' : 'the image') : 'Remove';
+      var what = k ? k + ' pattern' + (k > 1 ? 's' : '') + (deep ? ' + deep clean' : '') : (deep ? 'deep clean' : '');
+      go.textContent = what ? 'Remove (' + what + ') from ' + (n > 1 ? n + ' images' : 'the image') : 'Remove';
     }
+    deepBox.addEventListener('change', updateGo);
     function step(text, frac) {
       prog.classList.add('on');
       prog.firstChild.textContent = text;
@@ -463,34 +484,70 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
       if (busy) return;
       var carriers = [];
       found.concat(manual).forEach(function (r) { if (r.on) carriers = carriers.concat(r.carriers); });
-      if (!carriers.length || !lastFiles.length) return;
+      var deep = deepBox.checked && lastFiles.length >= 2;
+      if ((!carriers.length && !deep) || !lastFiles.length) return;
+      var fmt = fmtSel.value === 'png' ? 'png' : 'jpg', q = fmt === 'png' ? undefined : parseInt(fmtSel.value.split('-')[1], 10) / 100;
       busy = true; go.disabled = true; out.textContent = '';
-      var files = lastFiles.slice(), N = files.length, results = [], plan = null;
+      var files = lastFiles.slice(), N = files.length, results = [], plan = null, deepStats = null, check = null, size = null;
       var seq = function (fn) { return files.reduce(function (p, f, i) { return p.then(function () { return fn(f, i); }); }, Promise.resolve()); };
       step('Starting', 0.01);
       ask({ type: 'clean-begin', carriers: carriers }).then(function () {
+        if (!carriers.length) return null;
         return seq(function (f, i) {
-          step('Measuring the pattern in image ' + (i + 1) + ' of ' + N, 0.02 + 0.43 * i / N);
+          step('Measuring the named patterns in image ' + (i + 1) + ' of ' + N, 0.3 * i / N);
           return fullPixels(f.blob).then(function (px) {
+            size = size || [px.W, px.H];
             return ask({ type: 'clean-measure', rgba: px.data.buffer, width: px.W, height: px.H }, [px.data.buffer]);
           });
+        }).then(function () { step('Finding the exact frequencies', 0.3); return ask({ type: 'clean-solve' }); })
+          .then(function (m) { plan = m.plan; });
+      }).then(function () {
+        if (!deep) return null;
+        return (size ? Promise.resolve(size) : fullPixels(files[0].blob).then(function (px) { return [px.W, px.H]; })).then(function (sz) {
+          size = sz;
+          // large images: one colour channel per round to keep memory down
+          var rounds = sz[0] * sz[1] > 4e6 ? [['Y'], ['Cb'], ['Cr']] : [['Y', 'Cb', 'Cr']];
+          deepStats = {};
+          return rounds.reduce(function (p, chans, r) {
+            return p.then(function () { return ask({ type: 'clean-deep-begin', width: sz[0], height: sz[1], channels: chans }); })
+              .then(function () {
+                return seq(function (f, i) {
+                  step('Deep clean' + (rounds.length > 1 ? ' (' + chans[0] + ')' : '') + ': reading image ' + (i + 1) + ' of ' + N,
+                       0.3 + 0.35 * (r + i / N) / rounds.length);
+                  return fullPixels(f.blob).then(function (px) {
+                    return ask({ type: 'clean-deep-add', rgba: px.data.buffer, width: px.W, height: px.H, index: i }, [px.data.buffer]);
+                  });
+                });
+              })
+              .then(function () { step('Deep clean: separating what the images share', 0.3 + 0.35 * (r + 1) / rounds.length); return ask({ type: 'clean-deep-solve' }); })
+              .then(function (m) { Object.keys(m.stats).forEach(function (k) { deepStats[k] = m.stats[k]; }); });
+          }, Promise.resolve());
         });
       }).then(function () {
-        step('Finding the exact frequency', 0.46);
-        return ask({ type: 'clean-solve' });
-      }).then(function (m) {
-        plan = m.plan;
         return seq(function (f, i) {
-          step('Cleaning image ' + (i + 1) + ' of ' + N, 0.5 + 0.48 * i / N);
+          step('Writing image ' + (i + 1) + ' of ' + N + (fmt === 'png' ? ' (PNG)' : ' (JPG)'), 0.65 + 0.2 * i / N);
           return fullPixels(f.blob).then(function (px) {
             var W = px.W, H = px.H;
             return ask({ type: 'clean-apply', rgba: px.data.buffer, width: W, height: H, index: i }, [px.data.buffer])
-              .then(function (r) { return toPng(r.rgba, W, H).then(function (b) { results.push({ name: cleanName(f.name), blob: b, changed: r.changed }); }); });
+              .then(function (r) { return encode(r.rgba, W, H, fmt, q).then(function (b) { results.push({ name: cleanName(f.name, fmt), blob: b, changed: r.changed }); }); });
           });
         });
       }).then(function () {
+        // check the files exactly as saved
+        var W = size ? size[0] : 0, H = size ? size[1] : 0;
+        return ask({ type: 'clean-verify-begin', width: W, height: H, deep: deep && !!size }).then(function () {
+          return results.reduce(function (p, r, i) {
+            return p.then(function () {
+              step('Checking the saved file ' + (i + 1) + ' of ' + N, 0.85 + 0.14 * i / N);
+              return fullPixels(r.blob).then(function (px) {
+                return ask({ type: 'clean-verify-add', rgba: px.data.buffer, width: px.W, height: px.H, index: i }, [px.data.buffer]);
+              });
+            });
+          }, Promise.resolve());
+        }).then(function () { return ask({ type: 'clean-verify-done' }); }).then(function (m) { check = m; });
+      }).then(function () {
         busy = false; prog.classList.remove('on'); updateGo();
-        showResult(plan, results);
+        showResult(plan, deepStats, check, results, fmt, q);
       }).catch(function (err) {
         busy = false; prog.classList.remove('on'); updateGo();
         out.textContent = '';
@@ -498,18 +555,33 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
       });
     });
 
-    function showResult(plan, results) {
-      var lines = plan.carriers.map(function (c) {
+    function showResult(plan, deepStats, check, results, fmt, q) {
+      var saved = fmt === 'png' ? 'PNG' : 'JPG q' + Math.round(q * 100);
+      var lines = (plan ? plan.carriers : []).map(function (c, k) {
         var s = fixed(c.period, 3) + ' px at ' + fixed(c.angle, 1) + '° (' + CHAN[c.channel] + '): removed ±' + fixed(c.levels, 3) + ' levels, ';
         s += c.shared ? 'one estimate shared by all ' + results.length + ' images' : (results.length > 1 ? 'measured in each image separately (the images do not agree on its alignment)' : 'measured in this image');
         s += c.moved ? '; exact frequency found on the full images.' : '.';
+        if (check && check.left && check.left[k] !== undefined) s += ' In the saved ' + saved + ' files: ±' + fixed(check.left[k], 3) + ' left' + (results.length > 1 ? ' (shared)' : '') + '.';
         if (c.weak) s += ' Too faint to measure reliably here (signal ' + fixed(c.snr, 1) + '× its noise), so only part of it was taken out' + (results.length < 10 ? '; more images from the same source would measure it better.' : '.');
         return s;
       });
+      if (deepStats) {
+        var parts = ['Y', 'Cb', 'Cr'].filter(function (k) { return deepStats[k]; }).map(function (k) {
+          var st = deepStats[k];
+          return st.skipped ? CHAN[k] + ': skipped' : CHAN[k] + ' ±' + fixed(st.rms, 3) + ' rms (' + fixed(100 * st.share, 1) + '% of frequencies)';
+        });
+        var anySkip = ['Y', 'Cb', 'Cr'].some(function (k) { return deepStats[k] && deepStats[k].skipped; });
+        var s = 'Deep clean, everything else the ' + results.length + ' images share: ' + parts.join(', ') + '.';
+        if (anySkip) s += ' Skipped channels look like the same scene in every image (strong shared detail), not a mark; removing that would wipe real picture detail.';
+        if (check && check.deepLeft) s += ' A second pass over the saved files finds ±' + fixed(check.deepLeft.foundRms, 3) + ' rms of brightness detail still in common: that is the limit ' + results.length + ' images can separate from picture detail.';
+        if (results.length < 16) s += ' This pass gets stronger with more images: a noise-like mark of 0.4 level comes out about a quarter with 16 images, half with 48. Ripples come out almost entirely with far fewer.';
+        lines.push(s);
+      }
       out.appendChild(el('p', { 'class': 'sub', text: 'Done' }));
       out.appendChild(list(lines));
       var avg = results.reduce(function (s, r) { return s + r.changed; }, 0) / Math.max(1, results.length);
-      out.appendChild(el('p', { 'class': 'hint', text: fixed(100 * avg, 1) + '% of pixel values moved by one step; nothing else in the pictures was touched. Saved as PNG: a JPEG re-save would add its own noise.' }));
+      out.appendChild(el('p', { 'class': 'hint', text: fixed(100 * avg, 1) + '% of pixel values moved by one step before saving. Saved as ' + saved +
+        (fmt === 'png' ? '.' : '; the check above was made on the JPG files themselves, after compression.') + ' No metadata is written.' }));
       var links = el('div', { 'class': 'rm-files' });
       results.forEach(function (r) {
         links.appendChild(el('a', { href: URL.createObjectURL(r.blob), download: r.name, text: r.name }));
@@ -534,7 +606,7 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
       }
       var again = el('button', { type: 'button', 'class': 'btn ghost', text: 'Scan the cleaned image' + (results.length > 1 ? 's' : '') });
       again.addEventListener('click', function () {
-        fromFiles(results.map(function (r) { return new File([r.blob], r.name, { type: 'image/png' }); }));
+        fromFiles(results.map(function (r) { return new File([r.blob], r.name, { type: r.blob.type }); }));
         window.scrollTo({ top: 0, behavior: 'smooth' });
       });
       acts.appendChild(again);

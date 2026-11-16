@@ -42,47 +42,56 @@ centre, never shrunk.
 
 Under the verdict is a **Remove patterns** panel. Every watermark-like pattern the scan
 found is listed and ticked; a pattern can also be typed in by its repeat and angle, as
-this page's table reports them (rounded values are fine). Remove takes the ticked ones
-out of every image that was scanned, at full resolution (not just the analysed centre),
-and gives back PNGs: one by one, or all in a .zip. **Scan the cleaned images** runs the
-same scan on the result to confirm.
+this page's table reports them (rounded values are fine). With two or more images,
+**Deep clean** (on by default) also removes everything else the images share pixel for
+pixel. Output is **JPG** (quality 100/95/90/85, default 95) or PNG, one by one or all in
+a .zip, at full resolution. The page then decodes the files it saved and reports how
+much of each pattern is left in them, after compression. **Scan the cleaned images**
+runs the full scan on the result.
 
 How it works (`web/clean.js`):
 
-1. **Measure.** Each image is cut into tiles and each carrier wave is fitted in every
-   tile. Busy tiles count less. Tiles far above the rest are real texture near the same
-   frequency (a fence, a fabric) and are left out, so they are neither used nor touched.
-2. **Find the exact frequency.** A frequency read from a crop, a stack or a typed-in
-   value is close but not exact, and over a 4000-pixel row a tiny error becomes a large
-   phase drift. The tool searches for the frequency at which the tiles of all images line
-   up best, and keeps it only if it beats what noise alone could produce.
-3. **Estimate once, from all images.** When the images agree on the ripple's alignment
-   (the usual case for a watermark) one shared amplitude and phase is used for all of
-   them, which is much less noisy than any single image's. Otherwise each image gets its
-   own. Estimates that are mostly noise are shrunk toward zero rather than subtracted.
-4. **Subtract with dither.** The ripple is subtracted (in brightness by changing R, G and
-   B equally, in a colour channel through the JPEG colour transform). A correction of
-   0.05 of a level would vanish when rounded to 8 bits, so pixels are quantised with
-   dither, `floor(x + U[0,1))`, which is unbiased: on average every pixel lands on the
-   corrected value. Clipped pixels (0 or 255) are left exactly as they were.
+1. **Named patterns.** Each carrier wave is fitted in tiles of every image (busy tiles
+   count less; tiles far above the rest are real texture such as a fence and are left
+   out). The exact frequency is found as the one at which the tiles of all images line
+   up best, kept only if it beats what noise could produce. When the images agree on the
+   alignment (the usual case for a watermark), one shared amplitude and phase from all
+   of them is used.
+2. **Deep clean.** Whatever the scan could not name: parts too faint to report, and
+   marks that are not ripples at all (fixed noise-like patterns). Each image's fine
+   detail is averaged, weighted toward quiet areas, in two halves (odd and even images).
+   Picture content differs between the halves; a mark is identical in both. In 256-pixel
+   tiles both are taken to frequencies and only what the halves agree on is kept
+   (Wiener weighting), turned back into pixels and subtracted, in brightness and both
+   colour channels. If the images share real content (the same scene in all of them),
+   that channel is skipped rather than wiping picture detail.
+3. **Subtract with dither.** A 0.05-level correction would vanish when rounded to 8 bits,
+   so pixels are quantised with dither, `floor(x + U[0,1))`, which is unbiased: on
+   average every pixel lands on the corrected value. Clipped pixels (0 or 255) are left
+   exactly as they were. JPEG compression does not undo it: a test stack measured
+   ±0.0066 left of a ±0.12 ripple as PNG, and the same after JPEG q95 and q85.
 
-`python tests/test_clean.py` checks it on known answers: 16 generated pictures sharing
-a 5.03 px ripple at 86° and a 2.05 px ripple at 92°, one picture also carrying strong
-real 5.2 px stripes in one region.
+Checks on known answers (`python tests/test_clean.py`, `python tests/test_deep.py`):
+16 generated pictures sharing five marks. Removal per picture, against the truth:
 
-| Case | 5.03 px removed | 2.05 px removed | Real texture changed |
+| Mark | Carriers only | + deep clean, PNG | + deep clean, JPG q90 4:2:0 |
 |---|---|---|---|
-| found by the scan (±0.12 and ±0.05) | 97–98% | 90–92% | 1.0% |
-| typed in, exact (±0.05 and ±0.03) | 93–94% | 82–85% | 0.5% |
-| typed in, true ripple at 5.034 px / 86.3° and 2.053 px / 91.7° | 93–94% | 95–97% | 0.5% |
-| one picture alone, typed in (±0.05 and ±0.03) | 61% | 57% | 0.5% |
+| 5.03 px ripple at 86°, ±0.12 | 100% | 99% | 99% |
+| 2.05 px ripple at 92°, ±0.05 | 101% | 102% | 103% |
+| 3.7 px ripple at 20°, ±0.04 | 102% | 103% | 100% |
+| 4.4 px ripple at 140° in Cr colour, ±0.1 | 102% | 102% | 101% |
+| fixed noise-like pattern, 0.4 level rms | 0% | 27% | 38% |
 
-After cleaning, a scan of the cleaned stack reports neither ripple. One picture alone
-cannot measure a ripple this faint precisely, so only part of it is taken out (the page
-says so); 10 or more pictures from the same source measure it well.
+A noise-like mark is spread over every frequency, so it is only as separable from
+picture detail as the number of images allows: about 18% with 8 images, 27% with 16,
+42% with 32 and 50% with 48. Ripples come out almost entirely with far fewer. Eight
+pictures of the same scene are recognised as shared scenery and left alone. Typed-in
+values that are slightly off (true ripple 5.034 px at 86.3°, typed 5.03 and 86) are
+corrected to the exact frequency. One picture alone cannot measure a faint ripple
+precisely: about 60% of a ±0.05 ripple comes out, and the page says so.
 
-Notes: output is PNG, because a JPEG re-save adds its own noise. Pixel values are kept as
-stored; an embedded colour profile is not carried over.
+Notes: pixel values are kept as stored; an embedded colour profile and metadata are not
+written. Browsers save JPG with colour at half resolution (4:2:0).
 
 ### Several images: stacking
 
@@ -247,12 +256,13 @@ whole-frame patterns are all there. `--full` analyses up to 4096 px per side ins
 index.html                the browser tool (built from web/)
 web/core.js               the analysis, ported to JavaScript
 web/render.js             report text and pictures for the page
-web/clean.js              pattern removal (measure, exact frequency, subtract with dither)
+web/clean.js              pattern removal (named carriers, deep clean, subtract with dither)
 web/template.html         page layout and controls
 web/build.py              assembles index.html
 tests/compare_js.py       checks the browser core against the Python tool (needs Node.js)
 tests/test_stack.py       known-answer check of multi-image stacking (needs Node.js)
 tests/test_clean.py       known-answer check of pattern removal (needs Node.js)
+tests/test_deep.py        known-answer check of deep clean, PNG and JPG output (needs Node.js)
 tests/run_clean.js        Node harness for it: scan, remove, scan again
 patternscan/analyze.py    the analysis (spectra, peak finding, measurement, classification)
 patternscan/report.py     pictures and the HTML report
