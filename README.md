@@ -17,7 +17,7 @@ A single-file browser tool for editing an image at the pixel level and getting a
 
 ## Also in this repo
 
-**[Pattern Scan](pattern-scan/)** (`pattern-scan/index.html`): finds watermark-like ripples in one image or a stack of images, and removes them (Remove patterns panel under the verdict).
+**[Pattern Scan](pattern-scan/)** (`pattern-scan/index.html`): finds watermark-like ripples in one image or a stack of images, and removes them, saving JPG or PNG (Remove patterns panel under the verdict).
 
 ## Views
 

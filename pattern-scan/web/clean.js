@@ -309,6 +309,269 @@
     return { rgba: out, changed: changed / (3 * n) };
   }
 
+  /* ---------- deep clean: everything the images share, pixel for pixel ----------
+
+     The carriers above are the patterns the scan could name. A watermark can also hold
+     parts too faint to name, or be no ripple at all (a fixed noise-like pattern). What
+     all such marks have in common is that they sit at the same pixels in every image.
+
+     Each image's fine detail (the image minus a 9-pixel blur; the estimate is divided by
+     that filter's response afterwards, so nothing is lost above about 1/18 cycle per
+     pixel) is averaged, weighted toward quiet areas, in two halves: odd and even images. Picture content differs
+     between the halves; a mark is identical in both. In overlapping 256-pixel tiles both
+     half-averages are taken to frequencies, and at each frequency the part the halves
+     agree on (their cross-power) is compared with the part they disagree on (noise).
+     Only what clearly agrees is kept (Wiener weighting), turned back into pixels and
+     subtracted from every image. The estimate is built from the stack itself, so
+     subtracting it can only shrink what the images share. How much of a faint mark can
+     be separated from picture detail grows with the number of images: for a noise-like
+     mark of 0.4 level, about a quarter with 16 images and half with 48; ripples, which
+     sit at a few frequencies, come out almost entirely with far fewer. If the halves agree on a large share of frequencies,
+     the images share real content (the same scene) rather than a mark, and the pass is
+     skipped instead of wiping that content. */
+
+  function fftPow2(re, im, n, inv) {
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = (inv ? 2 : -2) * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let cr = 1, ci = 0;
+        for (let k = 0; k < len >> 1; k++) {
+          const a = i + k, b = a + (len >> 1);
+          const xr = re[b] * cr - im[b] * ci, xi = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
+          const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+        }
+      }
+    }
+    if (inv) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+  }
+  function fft2(re, im, n, inv) {
+    const r = new Float64Array(n), i2 = new Float64Array(n);
+    for (let y = 0; y < n; y++) {
+      const o = y * n;
+      for (let x = 0; x < n; x++) { r[x] = re[o + x]; i2[x] = im[o + x]; }
+      fftPow2(r, i2, n, inv);
+      for (let x = 0; x < n; x++) { re[o + x] = r[x]; im[o + x] = i2[x]; }
+    }
+    for (let x = 0; x < n; x++) {
+      for (let y = 0; y < n; y++) { r[y] = re[y * n + x]; i2[y] = im[y * n + x]; }
+      fftPow2(r, i2, n, inv);
+      for (let y = 0; y < n; y++) { re[y * n + x] = r[y]; im[y * n + x] = i2[y]; }
+    }
+  }
+
+  // separable box mean, Float32, edges clamped; out may not alias src
+  function box32(src, w, h, size, out, tmp) {
+    const half = size >> 1, inv = 1 / size;
+    for (let y = 0; y < h; y++) {
+      const o = y * w;
+      let s = 0;
+      for (let k = -half; k <= half; k++) s += src[o + Math.min(w - 1, Math.max(0, k))];
+      for (let x = 0; x < w; x++) {
+        tmp[o + x] = s * inv;
+        s += src[o + Math.min(w - 1, x + half + 1)] - src[o + Math.max(0, x - half)];
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      let s = 0;
+      for (let k = -half; k <= half; k++) s += tmp[Math.min(h - 1, Math.max(0, k)) * w + x];
+      for (let y = 0; y < h; y++) {
+        out[y * w + x] = s * inv;
+        s += tmp[Math.min(h - 1, y + half + 1) * w + x] - tmp[Math.max(0, y - half) * w + x];
+      }
+    }
+    return out;
+  }
+
+  const DEEP_BLUR = 9, DEEP_T = 256;
+
+  function deepBegin(w, h, channels) {
+    const n = w * h, D = { w, h, channels: channels.slice(), count: [0, 0], acc: {} };
+    for (const ch of channels) D.acc[ch] = { sA: new Float32Array(n), sB: new Float32Array(n) };
+    D.wA = new Float32Array(n); D.wB = new Float32Array(n);
+    return D;
+  }
+
+  /* One image (already corrected for the named carriers, as floats per channel plane). */
+  function deepAdd(D, rgba, corr, index) {
+    const { w, h } = D, n = w * h, half = index % 2;
+    const valid = validMask(rgba, n);
+    const plane = new Float32Array(n), blur = new Float32Array(n), tmp = new Float32Array(n);
+    const wts = new Float32Array(n);
+    // weights from brightness detail: quiet areas count more, clipped pixels not at all
+    let first = true;
+    const chans = D.channels.includes('Y') ? ['Y'].concat(D.channels.filter(c => c !== 'Y')) : ['Y'].concat(D.channels);
+    for (const ch of chans) {
+      const k = PLANE[ch];
+      for (let i = 0; i < n; i++) {
+        const r = rgba[i * 4] + (corr ? corr[0][i] : 0), g = rgba[i * 4 + 1] + (corr ? corr[1][i] : 0), b = rgba[i * 4 + 2] + (corr ? corr[2][i] : 0);
+        plane[i] = k[0] * r + k[1] * g + k[2] * b;
+      }
+      box32(plane, w, h, DEEP_BLUR, blur, tmp);
+      for (let i = 0; i < n; i++) plane[i] -= blur[i];             // fine detail
+      if (first) {
+        for (let i = 0; i < n; i++) blur[i] = plane[i] * plane[i];
+        box32(blur, w, h, 9, wts, tmp);
+        for (let i = 0; i < n; i++) wts[i] = valid[i] ? 1 / (wts[i] + 0.5) : 0;
+        const W = half ? D.wB : D.wA;
+        for (let i = 0; i < n; i++) W[i] += wts[i];
+        first = false;
+      }
+      if (!D.acc[ch]) continue;
+      const S = half ? D.acc[ch].sB : D.acc[ch].sA;
+      for (let i = 0; i < n; i++) S[i] += wts[i] * plane[i];
+    }
+    D.count[half]++;
+  }
+
+  /* -> { P: { ch: Float32Array pattern in that plane }, stats: { ch: {...} } } */
+  function deepSolve(D, opts) {
+    opts = opts || {};
+    const { w, h } = D, n = w * h, T = Math.min(DEEP_T, 1 << Math.floor(Math.log2(Math.max(16, Math.min(w, h))))), step = T >> 1;
+    const win = new Float64Array(T);
+    for (let i = 0; i < T; i++) win[i] = Math.sin(Math.PI * (i + 0.5) / T);   // sin x sin = Hann, overlaps sum to 1
+    // regular grid reaching past the frame (edges mirrored), so every pixel is covered by
+    // exactly two tiles per axis and the windows add up to one everywhere
+    const xs = [], ys = [];
+    for (let x = -step; x < w; x += step) xs.push(x);
+    for (let y = -step; y < h; y += step) ys.push(y);
+    const mir = (i, m) => { if (m === 1) return 0; const p = 2 * m - 2; i = ((i % p) + p) % p; return i < m ? i : p - i; };
+    const out = { P: {}, stats: {} };
+    if (D.count[0] < 1 || D.count[1] < 1) return out;
+    const B = opts.blur || DEEP_BLUR, kappa = opts.kappa || 1, R = opts.smooth === undefined ? 1 : opts.smooth;
+    // the detail filter (image minus a B-pixel box blur) passes frequency f with gain
+    // 1 - box(fx) box(fy); the estimate is divided by it where it is not too small
+    const boxResp = f => { const s = Math.sin(Math.PI * f); return Math.abs(s) < 1e-9 ? 1 : Math.sin(Math.PI * B * f) / (B * s); };
+    const hp = new Float64Array(T * T);
+    for (let fy = 0; fy < T; fy++) for (let fx = 0; fx < T; fx++) hp[fy * T + fx] = 1 - boxResp(fx / T) * boxResp(fy / T);
+    for (const ch of D.channels) {
+      const { sA, sB } = D.acc[ch];
+      const P = new Float32Array(n), Wsum = new Float32Array(n);
+      let kept = 0, bins = 0, removedPow = 0, totalPow = 0;
+      const Ar = new Float64Array(T * T), Ai = new Float64Array(T * T), Br = new Float64Array(T * T), Bi = new Float64Array(T * T);
+      const cr = new Float64Array(T * T), ns = new Float64Array(T * T);
+      for (const y0 of ys) for (const x0 of xs) {
+        for (let dy = 0; dy < T; dy++) {
+          const yy = mir(y0 + dy, h);
+          for (let dx = 0; dx < T; dx++) {
+            const i = yy * w + mir(x0 + dx, w), q = dy * T + dx, ww = win[dy] * win[dx];
+            Ar[q] = D.wA[i] > 0 ? ww * sA[i] / D.wA[i] : 0; Ai[q] = 0;
+            Br[q] = D.wB[i] > 0 ? ww * sB[i] / D.wB[i] : 0; Bi[q] = 0;
+          }
+        }
+        fft2(Ar, Ai, T, false); fft2(Br, Bi, T, false);
+        for (let q = 0; q < T * T; q++) {
+          cr[q] = Ar[q] * Br[q] + Ai[q] * Bi[q];
+          const dr = Ar[q] - Br[q], di = Ai[q] - Bi[q];
+          ns[q] = (dr * dr + di * di) / 4;
+        }
+        // agreement vs disagreement, each summed over neighbouring frequencies (window
+        // makes neighbours correlated, hence the margin kappa before anything is kept)
+        for (let fy = 0; fy < T; fy++) for (let fx = 0; fx < T; fx++) {
+          const q = fy * T + fx;
+          let c = 0, s = 0;
+          for (let oy = -R; oy <= R; oy++) for (let ox = -R; ox <= R; ox++) {
+            const qq = ((fy + oy + T) % T) * T + ((fx + ox + T) % T);
+            c += cr[qq]; s += ns[qq];
+          }
+          const Sr = (Ar[q] + Br[q]) / 2, Si = (Ai[q] + Bi[q]) / 2, pw = Sr * Sr + Si * Si;
+          let g = 0;
+          if (hp[q] >= 0.35 && c > kappa * s) g = c / (c + s) / hp[q];
+          bins++; if (g > 0) kept++;
+          totalPow += pw; removedPow += Math.min(1, g * g) * pw;
+          Ar[q] = g * Sr; Ai[q] = g * Si;
+        }
+        fft2(Ar, Ai, T, true);
+        for (let dy = 0; dy < T; dy++) {
+          const y = y0 + dy;
+          if (y < 0 || y >= h) continue;
+          for (let dx = 0; dx < T; dx++) {
+            const x = x0 + dx;
+            if (x < 0 || x >= w) continue;
+            const i = y * w + x, ww = win[dy] * win[dx];
+            P[i] += ww * Ar[dy * T + dx]; Wsum[i] += ww * ww;
+          }
+        }
+      }
+      let ss = 0;
+      for (let i = 0; i < n; i++) { P[i] = Wsum[i] > 0.25 ? P[i] / Wsum[i] : 0; ss += P[i] * P[i]; }
+      const share = bins ? kept / bins : 0, rms = Math.sqrt(ss / n);
+      // a mark is faint; shared scenery (the same scene in every image) is strong, and
+      // covers nearly every frequency
+      const content = rms > (opts.maxRms || 1.5) || (share > 0.6 && rms > 0.75);
+      if (content) P.fill(0);
+      else for (let i = 0; i < n; i++) P[i] = Math.max(-4, Math.min(4, P[i]));
+      out.P[ch] = P;
+      out.stats[ch] = { rms: content ? 0 : rms, foundRms: rms, share, energy: totalPow ? removedPow / totalPow : 0, skipped: content };
+    }
+    return out;
+  }
+
+  /* Float correction (R, G, B) for one image from the named carriers. */
+  function carrierCorrection(w, h, plan, index) {
+    const n = w * h, corr = [new Float32Array(n), new Float32Array(n), new Float32Array(n)];
+    if (!plan) return corr;
+    plan.carriers.forEach((c, k) => {
+      const z = (plan.amps[index] || [])[k];
+      if (!z || (!z[0] && !z[1])) return;
+      const back = BACK[c.channel], cr = Math.cos(TAU * c.u), sr = Math.sin(TAU * c.u);
+      for (let y = 0; y < h; y++) {
+        let co = 0, si = 0;
+        for (let x = 0; x < w; x++) {
+          if ((x & 127) === 0) { const ph = TAU * (c.u * x + c.v * y); co = Math.cos(ph); si = Math.sin(ph); }
+          const d = z[0] * co - z[1] * si, i = y * w + x;
+          corr[0][i] -= back[0] * d; corr[1][i] -= back[1] * d; corr[2][i] -= back[2] * d;
+          const c2 = co * cr - si * sr; si = si * cr + co * sr; co = c2;
+        }
+      }
+    });
+    return corr;
+  }
+
+  /* Final pixels: carriers and the deep pattern subtracted, quantised with dither. */
+  function finish(rgba, w, h, plan, deep, index, opts) {
+    opts = opts || {};
+    const n = w * h, valid = validMask(rgba, n), out = new Uint8ClampedArray(rgba);
+    const corr = carrierCorrection(w, h, plan, index);
+    if (deep && deep.P) for (const ch of Object.keys(deep.P)) {
+      const P = deep.P[ch], back = BACK[ch];
+      for (let i = 0; i < n; i++) {
+        const d = P[i];
+        corr[0][i] -= back[0] * d; corr[1][i] -= back[1] * d; corr[2][i] -= back[2] * d;
+      }
+    }
+    const rnd = xorshift(opts.seed || (index + 1) * 2654435761);
+    let changed = 0;
+    for (let i = 0; i < n; i++) {
+      if (!valid[i]) continue;
+      for (let c = 0; c < 3; c++) {
+        const v = Math.floor(rgba[i * 4 + c] + corr[c][i] + rnd());
+        const q = v < 0 ? 0 : v > 255 ? 255 : v;
+        if (q !== rgba[i * 4 + c]) changed++;
+        out[i * 4 + c] = q;
+      }
+    }
+    return { rgba: out, changed: changed / (3 * n) };
+  }
+
+  /* After saving (e.g. as JPEG): how much of each carrier is left, shared over the images. */
+  function residual(ms, plan) {
+    return plan.carriers.map((c, k) => {
+      let ar = 0, ai = 0, aw = 0;
+      for (const m of ms) {
+        const r = coherent(m.fields[k], 0, 0);
+        ar += r[0]; ai += r[1]; aw += r[2];
+      }
+      return aw ? Math.hypot(ar, ai) / aw : 0;
+    });
+  }
+
   /* A typed-in pattern: stripe width (px) and the scan's angle (degrees, direction of change). */
   function carrierFromPeriodAngle(period, angleDeg, channel, levels) {
     const f = 1 / period, a = angleDeg * Math.PI / 180;
@@ -336,7 +599,8 @@
     return out;
   }
 
-  const PatternClean = { measure, solve, apply, carrierFromPeriodAngle, carriersFromPatterns, REMOVABLE, fitTiles };
+  const PatternClean = { measure, solve, apply, carrierFromPeriodAngle, carriersFromPatterns, REMOVABLE, fitTiles,
+                         deepBegin, deepAdd, deepSolve, carrierCorrection, finish, residual };
   if (typeof module !== 'undefined' && module.exports) module.exports = PatternClean;
   if (typeof self !== 'undefined') self.PatternClean = PatternClean;
 })();

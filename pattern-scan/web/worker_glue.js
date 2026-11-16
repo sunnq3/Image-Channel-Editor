@@ -35,7 +35,7 @@ function dedupe(list) {
 function cleanMessage(d) {
   var cl = self.PatternClean;
   if (d.type === 'clean-begin') {
-    cleaning = { carriers: dedupe(d.carriers), ms: [], plan: null };
+    cleaning = { carriers: dedupe(d.carriers || []), ms: [], plan: null, deepP: {}, deepStats: {}, D: null, vms: [], vD: null };
     self.postMessage({ type: 'ack', carriers: cleaning.carriers });
   } else if (d.type === 'clean-measure') {
     cleaning.ms.push(cl.measure(new Uint8ClampedArray(d.rgba), d.width, d.height, cleaning.carriers));
@@ -44,9 +44,35 @@ function cleanMessage(d) {
     cleaning.plan = cl.solve(cleaning.ms, cleaning.carriers, {});
     cleaning.ms = null;
     self.postMessage({ type: 'ack', plan: { carriers: cleaning.plan.carriers } });
+  } else if (d.type === 'clean-deep-begin') {
+    cleaning.D = cl.deepBegin(d.width, d.height, d.channels);
+    self.postMessage({ type: 'ack' });
+  } else if (d.type === 'clean-deep-add') {
+    cl.deepAdd(cleaning.D, new Uint8ClampedArray(d.rgba), cl.carrierCorrection(d.width, d.height, cleaning.plan, d.index), d.index);
+    self.postMessage({ type: 'ack' });
+  } else if (d.type === 'clean-deep-solve') {
+    var res = cl.deepSolve(cleaning.D, {});
+    cleaning.D = null;
+    Object.keys(res.P).forEach(function (ch) { cleaning.deepP[ch] = res.P[ch]; cleaning.deepStats[ch] = res.stats[ch]; });
+    self.postMessage({ type: 'ack', stats: res.stats });
   } else if (d.type === 'clean-apply') {
-    var r = cl.apply(new Uint8ClampedArray(d.rgba), d.width, d.height, cleaning.plan, d.index);
+    var r = cl.finish(new Uint8ClampedArray(d.rgba), d.width, d.height, cleaning.plan, { P: cleaning.deepP }, d.index);
     self.postMessage({ type: 'ack', rgba: r.rgba.buffer, changed: r.changed }, [r.rgba.buffer]);
+  } else if (d.type === 'clean-verify-begin') {
+    cleaning.deepP = {};                                   // free the pattern before checking
+    cleaning.vms = [];
+    cleaning.vD = d.deep ? cl.deepBegin(d.width, d.height, ['Y']) : null;
+    self.postMessage({ type: 'ack' });
+  } else if (d.type === 'clean-verify-add') {
+    var px = new Uint8ClampedArray(d.rgba);
+    if (cleaning.plan && cleaning.plan.carriers.length) cleaning.vms.push(cl.measure(px, d.width, d.height, cleaning.plan.carriers));
+    if (cleaning.vD) cl.deepAdd(cleaning.vD, px, null, d.index);
+    self.postMessage({ type: 'ack' });
+  } else if (d.type === 'clean-verify-done') {
+    var left = cleaning.vms.length ? cl.residual(cleaning.vms, cleaning.plan) : [];
+    var deepLeft = cleaning.vD ? cl.deepSolve(cleaning.vD, {}).stats.Y : null;
+    cleaning.vD = null; cleaning.vms = [];
+    self.postMessage({ type: 'ack', left: left, deepLeft: deepLeft });
   }
 }
 self.onmessage = function (e) {
