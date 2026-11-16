@@ -87,6 +87,21 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
 .rrow{padding:10px 0;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:4px;font-size:.92rem}
 .tag{display:inline-block;font:500 .72rem var(--mono);letter-spacing:.1em;text-transform:uppercase;
      color:#17130a;background:var(--signal);border-radius:3px;padding:3px 7px}
+.remove{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--signal);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:12px}
+.rm-list{display:flex;flex-direction:column;gap:6px}
+.rm-row{display:flex;gap:10px;align-items:flex-start;font-size:.93rem;cursor:pointer}
+.rm-row input{margin-top:.3em;accent-color:var(--signal);width:1.05em;height:1.05em;flex:none}
+.rm-row .x{margin-left:auto;background:none;border:0;color:var(--dim);cursor:pointer;font:500 .85rem var(--mono);padding:0 4px}
+.rm-add{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:flex-end}
+.rm-add label{display:flex;flex-direction:column;gap:4px;font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+.rm-add input{font:500 .9rem var(--mono);color:var(--ink);background:var(--ground);border:1px solid var(--line);border-radius:6px;padding:7px 8px;width:7.5em}
+.rm-add input:focus-visible,.rm-add select:focus-visible{outline:2px solid var(--signal);outline-offset:1px}
+.rm-prog{font:500 .85rem var(--mono);color:var(--dim);display:none;flex-direction:column;gap:8px}
+.rm-prog.on{display:flex}
+.rm-out{display:flex;flex-direction:column;gap:10px}
+.rm-files{display:flex;flex-wrap:wrap;gap:6px 14px;font:400 .85rem var(--mono)}
+.rm-files a{color:var(--signal);overflow-wrap:anywhere}
+.rm-warn{color:var(--bad)}
 @media (max-width:420px){dl{grid-template-columns:1fr;gap:0 0}dd{margin-bottom:6px}}
 @media (prefers-reduced-motion:reduce){.bar i{transition:none}}
 </style>
@@ -127,6 +142,8 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
   var SAMPLE_B64 = '__SAMPLE_B64__';
   var $ = function (id) { return document.getElementById(id); };
   var worker = null, busy = false, lastSummary = '';
+  var lastFiles = [];      // the full image files the current report is about
+  var manual = [];         // patterns typed in by hand, kept between reports
 
   function el(tag, attrs, kids) {
     var n = document.createElement(tag);
@@ -248,7 +265,7 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
       return ask({ rgba: px.data.buffer, width: px.r.cw, height: px.r.ch, head: r[1], name: name,
                    orig: { width: px.W, height: px.H, x0: px.r.x0, y0: px.r.y0 } }, [px.data.buffer, r[1]]);
     }, function () { throw new Error(UNREADABLE); })
-      .then(function (m) { finish(m.report, isSample); })
+      .then(function (m) { lastFiles = [{ blob: blob, name: name }]; finish(m.report, isSample); })
       .catch(function (err) { fail(err.message || String(err)); });
   }
 
@@ -294,11 +311,242 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
           return ask({ type: 'coh-add', rgba: px.data.buffer }, [px.data.buffer]);
         });
       }).then(function () { return ask({ type: 'stack-finish' }); });
-    }).then(function (m) { finish(m.report, false); })
+    }).then(function (m) {
+      lastFiles = group.map(function (f) { return { blob: f, name: f.name || 'image' }; });
+      finish(m.report, false);
+    })
       .catch(function (err) {
         var msg = (err && err.message) || '';
         fail(/^(The |This |Stacking)/.test(msg) ? msg : UNREADABLE);
       });
+  }
+
+  /* ---------- removal ---------- */
+  var CHAN = { Y: 'brightness', Cb: 'blue–yellow colour', Cr: 'red–green colour' };
+  function fixed(x, d) { return (Math.round(x * Math.pow(10, d)) / Math.pow(10, d)).toFixed(d); }
+
+  // every pixel of a file, exactly as stored (no colour conversion, no resizing)
+  function fullPixels(blob) {
+    return decode(blob).then(function (bmp) {
+      var d = sizeOf(bmp);
+      if (!d.W || !d.H) throw new Error(UNREADABLE);
+      var cv = document.createElement('canvas');
+      cv.width = d.W; cv.height = d.H;
+      var ctx = cv.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' });
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(bmp, 0, 0);
+      var data = ctx.getImageData(0, 0, d.W, d.H).data;
+      if (bmp.close) bmp.close();
+      return { data: data, W: d.W, H: d.H };
+    });
+  }
+  function toPng(buf, W, H) {
+    var cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    cv.getContext('2d', { colorSpace: 'srgb' }).putImageData(new ImageData(new Uint8ClampedArray(buf), W, H), 0, 0);
+    return new Promise(function (resolve, reject) {
+      cv.toBlob(function (b) { if (b) resolve(b); else reject(new Error('Could not write the PNG (the image may be too large for this browser).')); }, 'image/png');
+    });
+  }
+
+  // a plain .zip (stored, no compression: PNGs are already compressed)
+  var CRC = (function () {
+    var t = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+  })();
+  function crc32(a) { var c = 0xffffffff; for (var i = 0; i < a.length; i++) c = CRC[(c ^ a[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+  function zipBlob(files) {           // files: [{ name, bytes: Uint8Array }]
+    var parts = [], central = [], offset = 0, enc = new TextEncoder();
+    files.forEach(function (f) {
+      var name = enc.encode(f.name), crc = crc32(f.bytes), len = f.bytes.length;
+      var h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true);
+      h.setUint16(8, 0, true); h.setUint16(10, 0, true); h.setUint16(12, 0x21, true);
+      h.setUint32(14, crc, true); h.setUint32(18, len, true); h.setUint32(22, len, true);
+      h.setUint16(26, name.length, true); h.setUint16(28, 0, true);
+      parts.push(h.buffer, name, f.bytes);
+      var c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true);
+      c.setUint16(10, 0, true); c.setUint16(12, 0, true); c.setUint16(14, 0x21, true);
+      c.setUint32(16, crc, true); c.setUint32(20, len, true); c.setUint32(24, len, true);
+      c.setUint16(28, name.length, true); c.setUint32(42, offset, true);
+      central.push(c.buffer, name);
+      offset += 30 + name.length + len;
+    });
+    var size = central.reduce(function (s, b) { return s + b.byteLength; }, 0);
+    var e = new DataView(new ArrayBuffer(22));
+    e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
+    e.setUint32(12, size, true); e.setUint32(16, offset, true);
+    return new Blob(parts.concat(central, [e.buffer]), { type: 'application/zip' });
+  }
+  function cleanName(name) {
+    var base = String(name || 'image').replace(/\.[^.\/\\]+$/, '');
+    return base + '-clean.png';
+  }
+
+  function removeSection(rep, isStack, isSample) {
+    var found = (rep.removable || []).map(function (p) {
+      return { label: '#' + p.n + ' · ' + p.label + ' · ' + fixed(p.period, 2) + ' px · ' + fixed(p.angle, 0) + '° · ±' + fixed(p.levels, 2) +
+                 (p.channel !== 'Y' ? ' · ' + CHAN[p.channel] : '') + (p.shared === true ? ' · in all images' : p.shared === false ? ' · not shared' : ''),
+               carriers: p.waves.map(function (w) { return { u: w[0], v: w[1], channel: p.channel, levels: p.levels }; }),
+               on: true };
+    });
+    var n = lastFiles.length;
+    var sec = el('section', { 'class': 'remove', id: 'remove' }, [
+      el('h2', { text: 'Remove patterns' }),
+      el('p', { 'class': 'hint', text: (found.length
+        ? 'Ticked patterns are subtracted from ' + (n > 1 ? 'all ' + n + ' images' : 'the image') + ' at full resolution. '
+        : 'The scan found no watermark-like pattern to take out. You can still type one in below. ') +
+        'The exact frequency is found again on the full images, the ripple is measured' + (n > 1 ? ' from all of them together' : '') +
+        ' and subtracted, and the result is saved as PNG with dither so a correction smaller than one brightness step still takes effect. Real texture near the same frequency is left alone.' })
+    ]);
+    var listBox = el('div', { 'class': 'rm-list' });
+    function drawList() {
+      listBox.textContent = '';
+      var rows = found.concat(manual);
+      if (!rows.length) listBox.appendChild(el('p', { 'class': 'hint', text: 'Nothing selected yet.' }));
+      rows.forEach(function (r) {
+        var cb = el('input', { type: 'checkbox' });
+        cb.checked = r.on;
+        cb.addEventListener('change', function () { r.on = cb.checked; updateGo(); });
+        var kids = [cb, el('span', { text: r.label })];
+        if (r.manual) {
+          var x = el('button', { type: 'button', 'class': 'x', 'aria-label': 'Remove this typed pattern', text: '✕' });
+          x.addEventListener('click', function (e) { e.preventDefault(); manual.splice(manual.indexOf(r), 1); drawList(); updateGo(); });
+          kids.push(x);
+        }
+        listBox.appendChild(el('label', { 'class': 'rm-row' }, kids));
+      });
+    }
+    sec.appendChild(listBox);
+
+    // typed-in pattern (as this page's table reports it)
+    var per = el('input', { type: 'number', step: '0.01', min: '2', placeholder: '5.03', id: 'rm-per' });
+    var ang = el('input', { type: 'number', step: '0.1', min: '0', max: '180', placeholder: '86', id: 'rm-ang' });
+    var chs = el('select', { id: 'rm-ch' }, [el('option', { value: 'Y', text: 'Brightness' }), el('option', { value: 'Cb', text: 'Cb colour' }), el('option', { value: 'Cr', text: 'Cr colour' })]);
+    var add = el('button', { type: 'button', 'class': 'btn ghost', text: 'Add' });
+    add.addEventListener('click', function () {
+      var p = parseFloat(per.value), a = parseFloat(ang.value);
+      if (!(p >= 2) || !(a >= 0 && a <= 180)) { per.focus(); return; }
+      var t = a * Math.PI / 180;
+      manual.push({ label: 'Typed · ' + fixed(p, 2) + ' px · ' + fixed(a, 1) + '°' + (chs.value !== 'Y' ? ' · ' + CHAN[chs.value] : ''),
+                    carriers: [{ u: Math.cos(t) / p, v: Math.sin(t) / p, channel: chs.value, levels: 0 }], on: true, manual: true });
+      per.value = ''; ang.value = '';
+      drawList(); updateGo();
+    });
+    var addRow = el('div', { 'class': 'rm-add' }, [
+      el('label', { 'for': 'rm-per' }, [document.createTextNode('Repeat (px)'), per]),
+      el('label', { 'for': 'rm-ang' }, [document.createTextNode('Angle (°)'), ang]),
+      el('label', { 'for': 'rm-ch' }, [document.createTextNode('Channel'), chs]),
+      add]);
+    sec.appendChild(el('details', { 'class': 'routine' }, [
+      el('summary', { text: 'Type a pattern in' }),
+      el('p', { 'class': 'hint', text: 'Use the Repeat and Angle columns of a Pattern Scan table. Rounded values are fine: the exact frequency is found on the images.' }),
+      addRow]));
+
+    var go = el('button', { type: 'button', 'class': 'btn', text: 'Remove' });
+    var prog = el('div', { 'class': 'rm-prog', role: 'status', 'aria-live': 'polite' }, [el('span', { text: '' }), el('div', { 'class': 'bar' }, [el('i')])]);
+    var out = el('div', { 'class': 'rm-out' });
+    function updateGo() {
+      var k = found.concat(manual).filter(function (r) { return r.on; }).length;
+      go.disabled = !k || !lastFiles.length;
+      go.style.opacity = go.disabled ? 0.5 : 1;
+      go.textContent = k ? 'Remove ' + k + ' pattern' + (k > 1 ? 's' : '') + ' from ' + (n > 1 ? n + ' images' : 'the image') : 'Remove';
+    }
+    function step(text, frac) {
+      prog.classList.add('on');
+      prog.firstChild.textContent = text;
+      prog.lastChild.firstChild.style.width = Math.round(100 * Math.max(0, Math.min(1, frac))) + '%';
+    }
+    go.addEventListener('click', function () {
+      if (busy) return;
+      var carriers = [];
+      found.concat(manual).forEach(function (r) { if (r.on) carriers = carriers.concat(r.carriers); });
+      if (!carriers.length || !lastFiles.length) return;
+      busy = true; go.disabled = true; out.textContent = '';
+      var files = lastFiles.slice(), N = files.length, results = [], plan = null;
+      var seq = function (fn) { return files.reduce(function (p, f, i) { return p.then(function () { return fn(f, i); }); }, Promise.resolve()); };
+      step('Starting', 0.01);
+      ask({ type: 'clean-begin', carriers: carriers }).then(function () {
+        return seq(function (f, i) {
+          step('Measuring the pattern in image ' + (i + 1) + ' of ' + N, 0.02 + 0.43 * i / N);
+          return fullPixels(f.blob).then(function (px) {
+            return ask({ type: 'clean-measure', rgba: px.data.buffer, width: px.W, height: px.H }, [px.data.buffer]);
+          });
+        });
+      }).then(function () {
+        step('Finding the exact frequency', 0.46);
+        return ask({ type: 'clean-solve' });
+      }).then(function (m) {
+        plan = m.plan;
+        return seq(function (f, i) {
+          step('Cleaning image ' + (i + 1) + ' of ' + N, 0.5 + 0.48 * i / N);
+          return fullPixels(f.blob).then(function (px) {
+            var W = px.W, H = px.H;
+            return ask({ type: 'clean-apply', rgba: px.data.buffer, width: W, height: H, index: i }, [px.data.buffer])
+              .then(function (r) { return toPng(r.rgba, W, H).then(function (b) { results.push({ name: cleanName(f.name), blob: b, changed: r.changed }); }); });
+          });
+        });
+      }).then(function () {
+        busy = false; prog.classList.remove('on'); updateGo();
+        showResult(plan, results);
+      }).catch(function (err) {
+        busy = false; prog.classList.remove('on'); updateGo();
+        out.textContent = '';
+        out.appendChild(el('p', { 'class': 'rm-warn', text: (err && err.message) || String(err) }));
+      });
+    });
+
+    function showResult(plan, results) {
+      var lines = plan.carriers.map(function (c) {
+        var s = fixed(c.period, 3) + ' px at ' + fixed(c.angle, 1) + '° (' + CHAN[c.channel] + '): removed ±' + fixed(c.levels, 3) + ' levels, ';
+        s += c.shared ? 'one estimate shared by all ' + results.length + ' images' : (results.length > 1 ? 'measured in each image separately (the images do not agree on its alignment)' : 'measured in this image');
+        s += c.moved ? '; exact frequency found on the full images.' : '.';
+        if (c.weak) s += ' Too faint to measure reliably here (signal ' + fixed(c.snr, 1) + '× its noise), so only part of it was taken out' + (results.length < 10 ? '; more images from the same source would measure it better.' : '.');
+        return s;
+      });
+      out.appendChild(el('p', { 'class': 'sub', text: 'Done' }));
+      out.appendChild(list(lines));
+      var avg = results.reduce(function (s, r) { return s + r.changed; }, 0) / Math.max(1, results.length);
+      out.appendChild(el('p', { 'class': 'hint', text: fixed(100 * avg, 1) + '% of pixel values moved by one step; nothing else in the pictures was touched. Saved as PNG: a JPEG re-save would add its own noise.' }));
+      var links = el('div', { 'class': 'rm-files' });
+      results.forEach(function (r) {
+        links.appendChild(el('a', { href: URL.createObjectURL(r.blob), download: r.name, text: r.name }));
+      });
+      out.appendChild(links);
+      var acts = el('div', { 'class': 'actions' });
+      if (results.length > 1) {
+        var zb = el('button', { type: 'button', 'class': 'btn', text: 'Download all (.zip)' });
+        zb.addEventListener('click', function () {
+          zb.disabled = true; zb.textContent = 'Packing';
+          Promise.all(results.map(function (r) { return r.blob.arrayBuffer(); })).then(function (bufs) {
+            var z = zipBlob(results.map(function (r, i) { return { name: r.name, bytes: new Uint8Array(bufs[i]) }; }));
+            var a = el('a', { href: URL.createObjectURL(z), download: 'cleaned-images.zip' });
+            document.body.appendChild(a); a.click(); a.remove();
+            zb.disabled = false; zb.textContent = 'Download all (.zip)';
+          });
+        });
+        acts.appendChild(zb);
+      } else {
+        var one = el('a', { 'class': 'btn', href: URL.createObjectURL(results[0].blob), download: results[0].name, text: 'Download ' + results[0].name, style: 'text-decoration:none' });
+        acts.appendChild(one);
+      }
+      var again = el('button', { type: 'button', 'class': 'btn ghost', text: 'Scan the cleaned image' + (results.length > 1 ? 's' : '') });
+      again.addEventListener('click', function () {
+        fromFiles(results.map(function (r) { return new File([r.blob], r.name, { type: 'image/png' }); }));
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      });
+      acts.appendChild(again);
+      out.appendChild(acts);
+      if (isSample) out.appendChild(el('p', { 'class': 'hint', text: 'This was the built-in sample. Choose your own images at the top to clean them.' }));
+    }
+
+    sec.appendChild(el('div', { 'class': 'actions' }, [go]));
+    sec.appendChild(prog);
+    sec.appendChild(out);
+    drawList(); updateGo();
+    return sec;
   }
 
   function cardNode(c) {
@@ -349,6 +597,7 @@ details.routine summary:focus-visible{outline:2px solid var(--signal);outline-of
       }))
     ]);
     root.appendChild(top);
+    root.appendChild(removeSection(rep, isStack, isSample));
 
     if (rep.shared && rep.shared.length) {
       var ssec = el('section', null, [el('h2', { text: 'What the images share' })]);

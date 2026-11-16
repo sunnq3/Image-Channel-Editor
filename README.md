@@ -15,6 +15,10 @@ A single-file browser tool for editing an image at the pixel level and getting a
 - **Survives compression** — edits are applied in the JPEG's own YCbCr space and written straight into the file by a built-in baseline encoder (4:4:4 or 4:2:0, quality 1–100). The tool then decodes that exact file and reports per-plane error, how much of each edit was kept, PSNR, gamut clipping, and an **evenness** score from a normalised error-level map (the **Seam map** view): how much of the image reacts to compression differently from the rest. A stress test re-encodes at 4:2:0 q75 to show what an upload will do.
 - **Export** — the JPG you save is byte-for-byte the file that was measured.
 
+## Also in this repo
+
+**[Pattern Scan](pattern-scan/)** (`pattern-scan/index.html`): finds watermark-like ripples in one image or a stack of images, and removes them (Remove patterns panel under the verdict).
+
 ## Views
 
 Original · Edited · Compressed (decoded from the actual JPEG) · Difference (×1–×16) · Grain map · Seam map · Edge map. Fit or 100% with panning.

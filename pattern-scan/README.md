@@ -38,6 +38,52 @@ The page analyses up to 1024 px per side by default (about 6 s on a laptop, long
 phone) or 2048 px on request. Larger images are read at full resolution from their
 centre, never shrunk.
 
+### Removing a pattern
+
+Under the verdict is a **Remove patterns** panel. Every watermark-like pattern the scan
+found is listed and ticked; a pattern can also be typed in by its repeat and angle, as
+this page's table reports them (rounded values are fine). Remove takes the ticked ones
+out of every image that was scanned, at full resolution (not just the analysed centre),
+and gives back PNGs: one by one, or all in a .zip. **Scan the cleaned images** runs the
+same scan on the result to confirm.
+
+How it works (`web/clean.js`):
+
+1. **Measure.** Each image is cut into tiles and each carrier wave is fitted in every
+   tile. Busy tiles count less. Tiles far above the rest are real texture near the same
+   frequency (a fence, a fabric) and are left out, so they are neither used nor touched.
+2. **Find the exact frequency.** A frequency read from a crop, a stack or a typed-in
+   value is close but not exact, and over a 4000-pixel row a tiny error becomes a large
+   phase drift. The tool searches for the frequency at which the tiles of all images line
+   up best, and keeps it only if it beats what noise alone could produce.
+3. **Estimate once, from all images.** When the images agree on the ripple's alignment
+   (the usual case for a watermark) one shared amplitude and phase is used for all of
+   them, which is much less noisy than any single image's. Otherwise each image gets its
+   own. Estimates that are mostly noise are shrunk toward zero rather than subtracted.
+4. **Subtract with dither.** The ripple is subtracted (in brightness by changing R, G and
+   B equally, in a colour channel through the JPEG colour transform). A correction of
+   0.05 of a level would vanish when rounded to 8 bits, so pixels are quantised with
+   dither, `floor(x + U[0,1))`, which is unbiased: on average every pixel lands on the
+   corrected value. Clipped pixels (0 or 255) are left exactly as they were.
+
+`python tests/test_clean.py` checks it on known answers: 16 generated pictures sharing
+a 5.03 px ripple at 86° and a 2.05 px ripple at 92°, one picture also carrying strong
+real 5.2 px stripes in one region.
+
+| Case | 5.03 px removed | 2.05 px removed | Real texture changed |
+|---|---|---|---|
+| found by the scan (±0.12 and ±0.05) | 97–98% | 90–92% | 1.0% |
+| typed in, exact (±0.05 and ±0.03) | 93–94% | 82–85% | 0.5% |
+| typed in, true ripple at 5.034 px / 86.3° and 2.053 px / 91.7° | 93–94% | 95–97% | 0.5% |
+| one picture alone, typed in (±0.05 and ±0.03) | 61% | 57% | 0.5% |
+
+After cleaning, a scan of the cleaned stack reports neither ripple. One picture alone
+cannot measure a ripple this faint precisely, so only part of it is taken out (the page
+says so); 10 or more pictures from the same source measure it well.
+
+Notes: output is PNG, because a JPEG re-save adds its own noise. Pixel values are kept as
+stored; an embedded colour profile is not carried over.
+
 ### Several images: stacking
 
 Choose several images of the same pixel size and the page stacks them instead of
@@ -201,10 +247,13 @@ whole-frame patterns are all there. `--full` analyses up to 4096 px per side ins
 index.html                the browser tool (built from web/)
 web/core.js               the analysis, ported to JavaScript
 web/render.js             report text and pictures for the page
+web/clean.js              pattern removal (measure, exact frequency, subtract with dither)
 web/template.html         page layout and controls
 web/build.py              assembles index.html
 tests/compare_js.py       checks the browser core against the Python tool (needs Node.js)
 tests/test_stack.py       known-answer check of multi-image stacking (needs Node.js)
+tests/test_clean.py       known-answer check of pattern removal (needs Node.js)
+tests/run_clean.js        Node harness for it: scan, remove, scan again
 patternscan/analyze.py    the analysis (spectra, peak finding, measurement, classification)
 patternscan/report.py     pictures and the HTML report
 patternscan/__main__.py   command line

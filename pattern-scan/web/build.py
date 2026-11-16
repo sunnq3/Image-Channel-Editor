@@ -31,7 +31,7 @@ def read(name):
         return fh.read()
 
 
-worker = "\n".join([read("core.js"), read("render.js"), read("worker_glue.js")])
+worker = "\n".join([read("core.js"), read("render.js"), read("clean.js"), read("worker_glue.js")])
 assert "</script" not in worker.lower() and "<!--" not in worker
 sample = sample_jpeg()
 page = read("template.html")
