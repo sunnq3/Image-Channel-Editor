@@ -85,14 +85,14 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
 <main>
 <header>
   <h1>Pattern Scan</h1>
-  <p class="lede">Finds repeating patterns in an image at every stripe width and direction, draws them on the picture, and says what each one most likely is: JPEG blocks, a resize trace, a faint overlay, or real texture.</p>
+  <p class="lede">Finds repeating patterns in an image at every stripe width and direction, draws them on the picture, and says what each one most likely is: JPEG blocks, a resize trace, a faint overlay, or real texture. Give it several images and it stacks them to bring out a pattern they all carry.</p>
 </header>
 
 <div class="pick" id="pick">
   <div class="pick-row">
-    <input class="visually-hidden" type="file" id="file" accept="image/*">
-    <label class="btn" for="file" id="file-label">Choose an image</label>
-    <span class="hint">or drop or paste one here. It stays on your device; nothing is uploaded.</span>
+    <input class="visually-hidden" type="file" id="file" accept="image/*" multiple>
+    <label class="btn" for="file" id="file-label">Choose image(s)</label>
+    <span class="hint">One image to analyse it. Several of the same size to stack them and find what they share. Nothing is uploaded.</span>
   </div>
   <div class="pick-row">
     <label class="size" for="size">Analyse up to
@@ -1020,8 +1020,15 @@ function bestChannel(p) {
 // ---------------------------------------------------------------- main
 function analyzePixels(rgba, W, H, info, opts, progress) {
   opts = opts || {};
-  progress = progress || (() => {});
   const L = loadPixels(rgba, W, H, info, opts.maxSide || 2048);
+  return analyzeChannels(L, info, opts, progress);
+}
+
+/* The analysis proper. L = {chans, rgb, w, h}. opts.res (optional) holds a stacked
+   noise residual per channel, which is scanned as one more source. */
+function analyzeChannels(L, info, opts, progress) {
+  opts = opts || {};
+  progress = progress || (() => {});
   const { chans, rgb, w, h } = L;
   if (Math.min(h, w) < 64) throw new Error('Image is too small to analyse (needs at least 64x64 pixels).');
 
@@ -1029,7 +1036,20 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
   let allPeaks = [];
   const names = Object.keys(chans);
   let step = 0;
-  const total = names.length * 4;
+  const total = names.length * (opts.res ? 6 : 4);
+  if (opts.res) {
+    for (const kind of ['res', 'resw']) for (const name of names) {
+      if (!opts.res[kind] || !opts.res[kind][name]) continue;
+      progress(`Scanning frequencies (${++step} of ${total})`, 0.05 + 0.6 * step / total);
+      sources[kind + ':' + name] = opts.res[kind][name];
+      const { E, P } = whitenedSpectrum(opts.res[kind][name], w, h, null);
+      const fp = findPeaks(E, P, w, h, 'A', name);
+      for (const p of fp.peaks) { p.weighted = false; p.src = kind; }
+      thresholds['A:' + name + ':' + kind] = fp.thr;
+      allPeaks = allPeaks.concat(fp.peaks);
+      if (name === 'Y' && kind === 'resw') spectra.A = E;
+    }
+  }
   for (const name of names) {
     const x = chans[name];
     const wtFine = flatnessWeight(x, w, h, 3), wtCoarse = flatnessWeight(x, w, h, 15);
@@ -1044,7 +1064,7 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
       for (const p of fp.peaks) { p.weighted = wt !== null; p.src = kind; }
       thresholds[view + ':' + name + ':' + kind + (wt ? 'w' : '')] = fp.thr;
       allPeaks = allPeaks.concat(fp.peaks);
-      if (name === 'Y' && (kind === 'val' || kind === 'lap') && wt !== null) spectra[view] = E;
+      if (name === 'Y' && (kind === 'val' || kind === 'lap') && wt !== null && !(view === 'A' && opts.res)) spectra[view] = E;
     }
   }
   progress('Measuring patterns', 0.7);
@@ -1054,7 +1074,12 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
 
   const measurePeak = (p) => {
     const c = bestChannel(p);
-    return measure(sources[p.src + ':' + c], w, h, p.u, p.v, p.weighted ? weights[p.view + ':' + c] : null);
+    const ms = measure(sources[p.src + ':' + c], w, h, p.u, p.v, p.weighted ? weights[p.view + ':' + c] : null);
+    if (p.src === 'res' || p.src === 'resw') {   // undo the residual's high-pass: strength in real levels
+      const g = Math.max(0.1, residualGain(p.u, p.v, p.src === 'res' ? RES_BOX : RES_BOX_WIDE));
+      ms.amp_global /= g; ms.amp_local /= g;
+    }
+    return ms;
   };
 
   const cache = new Map();
@@ -1145,6 +1170,7 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
   patterns.sort((a, b) => b.strength - a.strength);
 
   const fin = [];
+  const droppedInfo = [];
   let dropped = 0;
   for (let nMeasured = 0; nMeasured < patterns.length; nMeasured++) {
     if (fin.length >= 12 || nMeasured >= 24) break;
@@ -1163,7 +1189,7 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
         else pat.category = ms.amplitude < 8.0 ? 'global_faint' : 'global_visible';
       } else {
         ms.amplitude = ms.amp_local;
-        if (ms.amplitude < CFG.MIN_REGIONAL_AMPLITUDE) { dropped++; continue; }
+        if (ms.amplitude < CFG.MIN_REGIONAL_AMPLITUDE) { dropped++; droppedInfo.push({ period: peakPeriod(m), angle: peakAngle(m), src: m.src, score: m.score, amp: ms.amplitude, zones: [ms.zones_present, ms.zones_absent], global: ms.is_global, cat: pat.category }); continue; }
         pat.category = 'regional';
       }
       if (pat.category === 'global_faint' && ms.amplitude < CFG.TRACE_AMPLITUDE) pat.category = 'trace';
@@ -1175,8 +1201,8 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
       if ((pat.category === 'pixel_lattice' || pat.category === 'grid8') && ms.amplitude !== null
           && pat.peaks.every(q => q.view === 'A') && ms.amplitude < CFG.TRACE_AMPLITUDE) pat.category = 'trace';
     }
-    if ((pat.category === 'pixel_lattice' || pat.category === 'grid8') && !ms.is_global && ms.zones_absent >= 3) { dropped++; continue; }
-    if (pat.category === 'resampling' && pat.view === 'B' && !ms.is_global) { dropped++; continue; }
+    if ((pat.category === 'pixel_lattice' || pat.category === 'grid8') && !ms.is_global && ms.zones_absent >= 3) { dropped++; droppedInfo.push({ period: peakPeriod(m), angle: peakAngle(m), src: m.src, score: m.score, amp: ms.amplitude, zones: [ms.zones_present, ms.zones_absent], global: ms.is_global, cat: pat.category }); continue; }
+    if (pat.category === 'resampling' && pat.view === 'B' && !ms.is_global) { dropped++; droppedInfo.push({ period: peakPeriod(m), angle: peakAngle(m), src: m.src, score: m.score, amp: ms.amplitude, zones: [ms.zones_present, ms.zones_absent], global: ms.is_global, cat: pat.category }); continue; }
     if (pat.category === 'resampling') {
       const f = peakFreq(m);
       if (onAxis && f > 0.02 && f < 0.5) {
@@ -1190,10 +1216,138 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
   let thrMax = 0;
   for (const k of Object.keys(thresholds)) thrMax = Math.max(thrMax, thresholds[k]);
   return { info, rgb, w, h, chans, sources, weights, spectra, patterns: fin, jpeg,
-           thr: thrMax, n_scans: total, n_peaks: peaks.length, dropped };
+           thr: thrMax, n_scans: total, n_peaks: peaks.length, dropped, droppedInfo };
 }
 
-const PatternCore = { CFG, CATEGORIES, EXPLAIN, LN2, analyzePixels, parseFileHeader, reconstruct,
+// ---------------------------------------------------------------- stacking several images
+const RES_BOX = 5;                     // fine residual   = image - smooth3(image, 5)
+const RES_BOX_WIDE = 31;               // wide residual   = image - smooth3(image, 31)
+
+/* How much of a wave survives a residual's high-pass (1 = all of it). */
+function residualGain(u, v, box) {
+  const d = (f) => {
+    const a = Math.PI * f;
+    return Math.abs(Math.sin(a)) < 1e-9 ? 1 : Math.sin(a * box) / (box * Math.sin(a));
+  };
+  return 1 - Math.pow(d(u), 3) * Math.pow(d(v), 3);
+}
+
+/* Flat-image averaging and noise-residual stacking.
+   mean      = plain average of the images: each picture's own content shrinks, anything
+               identical in every image stays at full strength;
+   residual  = each image minus a smoothed copy of itself, averaged with more weight where
+               that image is smooth (inverse local variance, as for sensor-noise
+               fingerprints). Two versions: a fine one for narrow stripes and a wide one
+               that keeps slow ripples too. */
+function stackBegin(w, h) {
+  const n = w * h, z = () => new Float64Array(n), trio = () => ({ Y: z(), Cb: z(), Cr: z() });
+  return { w, h, n: 0, colour: false, rgb: new Float64Array(n * 3), sum: trio(),
+           num: trio(), den: trio(), numw: trio(), denw: trio() };
+}
+
+function stackAdd(st, rgba, W, H) {
+  if (W !== st.w || H !== st.h) throw new Error('Stacked images must all be the same size.');
+  const L = loadPixels(rgba, W, H, { notes: [] }, Math.max(W, H));
+  const n = st.w * st.h;
+  for (let i = 0; i < n * 3; i++) st.rgb[i] += L.rgb[i];
+  if (L.chans.Cb) st.colour = true;
+  for (const name of ['Y', 'Cb', 'Cr']) {
+    const x = L.chans[name];
+    if (!x) { for (let i = 0; i < n; i++) st.sum[name][i] += 128; continue; }
+    const sum = st.sum[name];
+    for (let i = 0; i < n; i++) sum[i] += x[i];
+    for (const [box, scale, num, den] of [[RES_BOX, 3, st.num[name], st.den[name]],
+                                          [RES_BOX_WIDE, 15, st.numw[name], st.denw[name]]]) {
+      const sm = smooth3(x, st.w, st.h, box), wt = flatnessWeight(x, st.w, st.h, scale);
+      for (let i = 0; i < n; i++) { num[i] += wt[i] * (x[i] - sm[i]); den[i] += wt[i]; }
+    }
+  }
+  st.n++;
+  return L;
+}
+
+function stackFinish(st) {
+  const n = st.w * st.h, names = st.colour ? ['Y', 'Cb', 'Cr'] : ['Y'];
+  const chans = {}, res = { res: {}, resw: {} };
+  for (const name of names) {
+    const m = new Float64Array(n), r = new Float64Array(n), rw = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      m[i] = st.sum[name][i] / st.n;
+      r[i] = st.den[name][i] > 0 ? st.num[name][i] / st.den[name][i] : 0;
+      rw[i] = st.denw[name][i] > 0 ? st.numw[name][i] / st.denw[name][i] : 0;
+    }
+    chans[name] = m; res.res[name] = r; res.resw[name] = rw;
+  }
+  const rgb = new Float64Array(n * 3);
+  for (let i = 0; i < n * 3; i++) rgb[i] = st.rgb[i] / st.n;
+  return { L: { chans, rgb, w: st.w, h: st.h }, res };
+}
+
+/* One image's amplitude and phase for one wave, over the whole frame. */
+function projectGlobal(src, w, h, u, v, weight) {
+  const box = boxFor(1 / Math.max(hyp(u, v), 1e-9), h, w);
+  const lp = boxFilter(src, w, h, box);
+  const cosx = new Float64Array(w), sinx = new Float64Array(w);
+  for (let x = 0; x < w; x++) { cosx[x] = Math.cos(2 * Math.PI * u * x); sinx[x] = Math.sin(2 * Math.PI * u * x); }
+  // Tapered to zero at the borders: a hard frame edge leaks slow content into every
+  // frequency with the SAME phase in every image, which would fake agreement.
+  const hx = hanning(w), hy = hanning(h);
+  let re = 0, im = 0, sw = 0;
+  for (let y = 0; y < h; y++) {
+    const cy = Math.cos(2 * Math.PI * v * y), sy = Math.sin(2 * Math.PI * v * y), o = y * w;
+    let rr = 0, ri = 0;
+    for (let x = 0; x < w; x++) {
+      const wt = (weight ? weight[o + x] : 1) * hx[x] * hy[y], val = (src[o + x] - lp[o + x]) * wt;
+      rr += val * cosx[x]; ri -= val * sinx[x]; sw += wt;
+    }
+    re += rr * cy + ri * sy; im += ri * cy - rr * sy;      // (rr + i ri) * (cy - i sy)
+  }
+  return [re / sw, im / sw];
+}
+
+/* Second pass: is each pattern there, with the same alignment, in every single image? */
+function coherenceAdd(patterns, L, acc) {
+  const cache = {};
+  const get = (kind, c) => {
+    const k = kind + ':' + c;
+    if (!cache[k]) {
+      const x = L.chans[c];
+      cache[k] = kind === 'lap' ? roughnessLap(x, L.w, L.h) : kind === 'step' ? roughnessStep(x, L.w, L.h)
+        : kind === 'wA' ? flatnessWeight(x, L.w, L.h, 15) : kind === 'wB' ? flatnessWeight(x, L.w, L.h, 3) : x;
+    }
+    return cache[k];
+  };
+  patterns.forEach((pat, i) => {
+    const m = pat.rep, c = L.chans[pat.channel] ? pat.channel : 'Y';
+    const kind = (m.src === 'lap' || m.src === 'step') ? m.src : 'val';
+    const a = projectGlobal(get(kind, c), L.w, L.h, m.u, m.v, get(m.view === 'B' ? 'wB' : 'wA', c));
+    (acc[i] = acc[i] || []).push(a);
+  });
+}
+
+function coherenceFinish(patterns, acc) {
+  patterns.forEach((pat, i) => {
+    const list = acc[i] || [], N = list.length;
+    let ur = 0, ui = 0;
+    const mags = [];
+    for (const [re, im] of list) { const m = hyp(re, im) || 1e-12; ur += re / m; ui += im / m; mags.push(m); }
+    const C = N ? hyp(ur, ui) / N : 0, phi = Math.atan2(ui, ur);
+    let aligned = 0;
+    for (const [re, im] of list) {
+      const m = hyp(re, im) || 1e-12;
+      if ((re * Math.cos(phi) + im * Math.sin(phi)) / m > 0.5) aligned++;   // within 60 degrees
+    }
+    const judged = N >= 5;
+    pat.across = { n: N, coherence: C, chance: N ? 1 / Math.sqrt(N) : 1, aligned,
+                   judged, shared: judged && N * C * C > 4.6 && C >= 0.5 && aligned >= 0.6 * N,
+                   typical_amp: N ? 2 * median(mags) : 0 };
+    // a sub-level ripple that every image carries is a finding, not a stray residue
+    if (pat.category === 'trace' && pat.across.shared) pat.category = 'global_faint';
+  });
+}
+
+const PatternCore = {
+  analyzeChannels, stackBegin, stackAdd, stackFinish, coherenceAdd, coherenceFinish, residualGain, projectGlobal, CFG, CATEGORIES, EXPLAIN, LN2, analyzePixels, parseFileHeader, reconstruct,
   peakPeriod, peakAngle, peakFreq, percentile, median, boxFilter, smooth3, whitenedSpectrum,
   findPeaks, measure, blockBoundaryTest, latticeOf, flatnessWeight, roughnessLap, roughnessStep };
 if (typeof module !== 'undefined' && module.exports) module.exports = PatternCore;
@@ -1258,11 +1412,23 @@ if (typeof self !== 'undefined') self.PatternCore = PatternCore;
     for (const p of pat.peaks) for (const c of Object.keys(p.channels)) seen.add(c);
     return ['Y', 'Cb', 'Cr'].filter(c => seen.has(c)).map(c => names[c]).join(', ');
   }
+  function acrossText(pat) {
+    const a = pat.across;
+    if (!a) return null;
+    const agree = `agreement ${a.coherence.toFixed(2)}; unrelated images would give about ${a.chance.toFixed(2)}`;
+    if (!a.judged) return `Same alignment in ${a.aligned} of ${a.n} images. At least 5 images are needed to judge whether they share it.`;
+    if (a.shared) return `Every image carries it: same alignment in ${a.aligned} of ${a.n} images (${agree}).`;
+    return `Not shared: the alignment agrees in only ${a.aligned} of ${a.n} images (${agree}). It comes from one or a few of the images.`;
+  }
   function summaryLines(res) {
     const pats = res.patterns, info = res.info, jp = res.jpeg, lines = [];
     const main = pats.filter(p => p.category !== 'trace'), traces = pats.filter(p => p.category === 'trace');
+    if (res.stack) {
+      lines.push(`${res.stack.n} images of ${res.w}\u00d7${res.h} px were stacked: averaged directly, and as noise residuals. Each picture's own content fades in the stack; whatever all of them carry stays.`);
+    }
     if (!pats.length) {
-      lines.push('No repeating pattern stands out from the picture\'s own detail at any frequency, in brightness or colour.');
+      lines.push(res.stack ? 'Nothing repeating survives the stack: the images share no regular pattern that stands out at any frequency.'
+        : 'No repeating pattern stands out from the picture\'s own detail at any frequency, in brightness or colour.');
     } else {
       const n = main.length;
       lines.push(`${n} repeating pattern${n !== 1 ? 's' : ''} found`
@@ -1274,6 +1440,7 @@ if (typeof self !== 'undefined') self.PatternCore = PatternCore;
       if (amp !== null && amp !== undefined && !LATTICE_CATS.includes(p.category)) bit += `, ±${amp.toFixed(1)} levels`;
       if (p.category === 'jpeg_grid' || p.category === 'chroma_grid') bit += '.';
       else bit += p.measure.is_global ? ', whole frame.' : ', part of the frame.';
+      if (p.across && p.across.judged) bit += p.across.shared ? ' Shared by all the images.' : ' Not shared by the images.';
       lines.push(bit);
     }
     if (info.is_jpeg) {
@@ -1477,9 +1644,9 @@ if (typeof self !== 'undefined') self.PatternCore = PatternCore;
       cards.push({
         n: i + 1, label, color: col, explain: EXPLAIN[pat.category], notes: pat.notes,
         fields: [['Repeats every', periodText(pat)], ['Direction', directionText(pat)],
-                 ['Strength', strengthText(pat)], ['Where', whereText(pat)],
+                 ['Strength', strengthText(pat)]].concat(acrossText(pat) ? [['Across images', acrossText(pat)]] : []).concat([['Where', whereText(pat)],
                  ['Found in', channelsText(pat)], ['Confidence', confidenceText(pat, res.thr)],
-                 ['Spectral peaks', String(pat.peaks.length)]],
+                 ['Spectral peaks', String(pat.peaks.length)]]),
         where, zoomLeft: zp.left, zoomRight: zp.right,
         zoomCaption: `Zoom on a ${zp.size}×${zp.size}-pixel patch at (${zp.x0}, ${zp.y0}), shown ${ZOOM}×. Left: the picture${zp.grid ? ' with the block grid drawn in' : ''}. Right: ${kind} ${zp.gain.toFixed(0)}×.`,
       });
@@ -1498,10 +1665,36 @@ if (typeof self !== 'undefined') self.PatternCore = PatternCore;
       }
     }
 
+    // what the stack itself looks like: the two classic pictures
+    const shared = [];
+    if (res.stack && res.stackRes) {
+      const cw = Math.min(res.w, MAX_DISPLAY), ch = Math.min(res.h, MAX_DISPLAY);
+      const x0 = (res.w - cw) >> 1, y0 = (res.h - ch) >> 1;
+      const panel = (a, title, text) => {
+        const crop = new Float64Array(cw * ch);
+        for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) crop[y * cw + x] = a[(y + y0) * res.w + x + x0];
+        const top = percentile(Float64Array.from(crop, Math.abs), 99) || 1e-9;
+        const gain = 110 / top, data = new Uint8ClampedArray(cw * ch * 4);
+        for (let i = 0; i < cw * ch; i++) {
+          const g = u8(128 + crop[i] * gain);
+          data[i * 4] = g; data[i * 4 + 1] = g; data[i * 4 + 2] = g; data[i * 4 + 3] = 255;
+        }
+        shared.push({ title, img: { w: cw, h: ch, data },
+          text: `${text} Brightness differences are amplified ${gain >= 10 ? gain.toFixed(0) : gain.toFixed(1)}\u00d7.` });
+      };
+      const mY = res.chans.Y, lp = C.smooth3(mY, res.w, res.h, 31), det = new Float64Array(mY.length);
+      for (let i = 0; i < det.length; i++) det[i] = mY[i] - lp[i];
+      panel(res.stackRes.res.Y, 'Stacked noise residual',
+        `Each image minus a smoothed copy of itself, averaged over all ${res.stack.n} images with more weight where an image is smooth. The pictures cancel; a pattern they share does not. An even grey field means they share nothing fine.`);
+      panel(det, 'Average of the images',
+        `The plain average of all ${res.stack.n} images with slow shading removed (flat-image averaging). On flat or plain images this shows a shared pattern directly, including wide stripes the residual cannot hold.`);
+    }
+
     const table = pats.map((p, i) => ({
       n: i + 1, cause: CATEGORIES[p.category][0], repeat: periodText(p), angle: `${peakAngle(p.rep).toFixed(0)}°`,
       levels: (p.measure.amplitude !== null && p.measure.amplitude !== undefined) ? p.measure.amplitude.toFixed(2) : '–',
       extent: (p.measure.is_global || p.category === 'jpeg_grid' || p.category === 'chroma_grid') ? 'whole' : 'part',
+      shared: p.across ? (p.across.judged ? (p.across.shared ? 'yes' : 'no') : '?') : null,
       strength: `${fmt0(p.strength / LN2)}×`, peaks: p.peaks.length,
     }));
 
@@ -1511,10 +1704,12 @@ if (typeof self !== 'undefined') self.PatternCore = PatternCore;
 
     const fmt = info.format + (info.jpeg_quality ? `, quality ≈ ${info.jpeg_quality}` : '');
     const report = {
-      meta: { name: info.path, width: info.width, height: info.height, format: fmt, scans: res.n_scans },
-      overlay, legend, summary: summaryLines(res), cards, history: historyLines(res), spectra, table, notes,
+      meta: { name: info.path, width: info.width, height: info.height, format: fmt, scans: res.n_scans,
+              stack: res.stack || null },
+      overlay, legend, summary: summaryLines(res), cards, history: historyLines(res), spectra, table, notes, shared,
     };
     const transfer = [overlay.data.buffer];
+    for (const sh of shared) transfer.push(sh.img.data.buffer);
     for (const c of cards) transfer.push(c.where.data.buffer, c.zoomLeft.data.buffer, c.zoomRight.data.buffer);
     for (const s of spectra) transfer.push(s.img.data.buffer);
     return { report, transfer };
@@ -1525,27 +1720,78 @@ if (typeof self !== 'undefined') self.PatternCore = PatternCore;
   if (typeof self !== 'undefined') self.PatternRender = PatternRender;
 })();
 
-/* Worker entry: pixels in, finished report out. */
-self.onmessage = function (e) {
-  var d = e.data;
-  try {
-    var progress = function (msg, frac) { self.postMessage({ type: 'progress', msg: msg, frac: frac }); };
-    var info = self.PatternCore.parseFileHeader(new Uint8Array(d.head), d.name);
-    var res = self.PatternCore.analyzePixels(new Uint8ClampedArray(d.rgba), d.width, d.height, info,
-      { maxSide: Math.max(d.width, d.height) }, progress);
-    if (d.orig && (d.orig.width !== d.width || d.orig.height !== d.height)) {
-      info.width = d.orig.width; info.height = d.orig.height;
-      info.notes.unshift('Image is large; analysed the central ' + d.width + 'x' + d.height +
-        ' pixels at full resolution (starting at ' + d.orig.x0 + ',' + d.orig.y0 +
-        '). Pictures and positions in this report refer to that region.');
-    }
-    var out = self.PatternRender.buildReport(res, progress);
-    self.postMessage({ type: 'done', report: out.report }, out.transfer);
-  } catch (err) {
-    var msg = String((err && err.message) || err);
-    if (/memory|allocation|Array buffer/i.test(msg)) msg = 'This device ran out of memory for that size. Choose 1024 px and try again.';
-    self.postMessage({ type: 'error', message: msg });
+/* Worker entry: pixels in, finished report out.
+   One image: a single message. Several images: stack-begin, stack-add (xN),
+   stack-analyse, coh-add (xN), stack-finish. */
+var stack = null;
+function progress(msg, frac) { self.postMessage({ type: 'progress', msg: msg, frac: frac }); }
+function fail(err) {
+  var msg = String((err && err.message) || err);
+  if (/memory|allocation|Array buffer/i.test(msg)) msg = 'This device ran out of memory for that size. Choose 1024 px, or fewer images, and try again.';
+  self.postMessage({ type: 'error', message: msg });
+  stack = null;
+}
+function finishStack() {
+  self.PatternCore.coherenceFinish(stack.res.patterns, stack.acc);
+  for (var i = 0; i < stack.res.patterns.length; i++) {
+    var pat = stack.res.patterns[i], a = pat.across;
+    if (a && a.judged && !a.shared) pat.notes.push('The images do not agree on this one, so it is not a mark they all carry. One or a few images contain it strongly enough to show through the average.');
   }
+  var out = self.PatternRender.buildReport(stack.res, function (m, f) { progress(m, 0.9 + 0.1 * f); });
+  stack = null;
+  self.postMessage({ type: 'done', report: out.report }, out.transfer);
+}
+self.onmessage = function (e) {
+  var d = e.data, core = self.PatternCore;
+  try {
+    if (d.type === 'stack-begin') {
+      stack = { st: core.stackBegin(d.width, d.height), orig: d.orig, skipped: d.skipped || 0,
+                allJpeg: true, first: null, acc: [] };
+      self.postMessage({ type: 'ack' });
+    } else if (d.type === 'stack-add') {
+      var hdr = core.parseFileHeader(new Uint8Array(d.head), d.name);
+      if (!hdr.is_jpeg) stack.allJpeg = false;
+      if (!stack.first) stack.first = hdr;
+      core.stackAdd(stack.st, new Uint8ClampedArray(d.rgba), stack.st.w, stack.st.h);
+      self.postMessage({ type: 'ack' });
+    } else if (d.type === 'stack-analyse') {
+      var n = stack.st.n, fin = core.stackFinish(stack.st);
+      stack.st = null;
+      var info = { path: n + ' images stacked', format: stack.allJpeg ? 'JPEG' : (stack.first.format === 'JPEG' ? 'mixed formats' : stack.first.format),
+                   is_jpeg: stack.allJpeg, jpeg_quality: stack.allJpeg ? stack.first.jpeg_quality : null,
+                   jpeg_subsampling: stack.allJpeg ? stack.first.jpeg_subsampling : null,
+                   width: stack.orig.width, height: stack.orig.height, notes: [] };
+      var res = core.analyzeChannels(fin.L, info, { res: fin.res }, function (m, f) { progress(m, 0.4 + 0.35 * f); });
+      if (stack.orig.width !== res.w || stack.orig.height !== res.h) {
+        info.notes.unshift('Images are large; stacked the central ' + res.w + 'x' + res.h + ' pixels of each at full resolution (starting at ' + stack.orig.x0 + ',' + stack.orig.y0 + ').');
+      }
+      if (stack.skipped) info.notes.push(stack.skipped + ' image(s) were left out because their size differs from the rest. A pattern tied to the pixel grid only lines up between images of the same size.');
+      if (n < 10) info.notes.push('Only ' + n + ' images were stacked. Each picture fades by the square root of the count, so 10 to 30 images of different scenes work much better.');
+      res.stack = { n: n, skipped: stack.skipped };
+      res.stackRes = fin.res;
+      stack.res = res;
+      if (!res.patterns.length) finishStack();
+      else self.postMessage({ type: 'need-pass2' });
+    } else if (d.type === 'coh-add') {
+      var L = core.stackAdd(core.stackBegin(stack.res.w, stack.res.h), new Uint8ClampedArray(d.rgba), stack.res.w, stack.res.h);
+      core.coherenceAdd(stack.res.patterns, L, stack.acc);
+      self.postMessage({ type: 'ack' });
+    } else if (d.type === 'stack-finish') {
+      finishStack();
+    } else {
+      var info1 = core.parseFileHeader(new Uint8Array(d.head), d.name);
+      var res1 = core.analyzePixels(new Uint8ClampedArray(d.rgba), d.width, d.height, info1,
+        { maxSide: Math.max(d.width, d.height) }, progress);
+      if (d.orig && (d.orig.width !== d.width || d.orig.height !== d.height)) {
+        info1.width = d.orig.width; info1.height = d.orig.height;
+        info1.notes.unshift('Image is large; analysed the central ' + d.width + 'x' + d.height +
+          ' pixels at full resolution (starting at ' + d.orig.x0 + ',' + d.orig.y0 +
+          '). Pictures and positions in this report refer to that region.');
+      }
+      var out = self.PatternRender.buildReport(res1, progress);
+      self.postMessage({ type: 'done', report: out.report }, out.transfer);
+    }
+  } catch (err) { fail(err); }
 };
 </script>
 <script>
@@ -1617,41 +1863,115 @@ self.onmessage = function (e) {
     return viaImg();
   }
 
-  function analyse(blob, name, isSample) {
-    if (busy) return;
-    busy = true;
-    $('error').classList.remove('on');
-    setStatus('Reading the image', 0.02);
-    var maxSide = parseInt($('size').value, 10) || 1024;
-    var headP = blob.slice(0, 1048576).arrayBuffer();
-    Promise.all([decode(blob), headP]).then(function (r) {
-      var bmp = r[0], head = r[1];
-      var W = bmp.width || bmp.naturalWidth, H = bmp.height || bmp.naturalHeight;
-      if (!W || !H) throw new Error('decode');
-      // central region at 1:1, kept on the 16-pixel grid so block patterns stay aligned
-      var cw = Math.min(W, maxSide), ch = Math.min(H, maxSide);
-      var x0 = W > maxSide ? Math.floor(Math.floor((W - cw) / 2) / 16) * 16 : 0;
-      var y0 = H > maxSide ? Math.floor(Math.floor((H - ch) / 2) / 16) * 16 : 0;
-      var cv = document.createElement('canvas');
-      cv.width = cw; cv.height = ch;
-      var ctx = cv.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' });
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(bmp, x0, y0, cw, ch, 0, 0, cw, ch);
-      var data = ctx.getImageData(0, 0, cw, ch).data;
-      if (bmp.close) bmp.close();
+  // one request to the worker; resolves with its next answer (progress is shown as it comes)
+  function ask(msg, transfer) {
+    return new Promise(function (resolve, reject) {
       var w = getWorker();
       w.onmessage = function (e) {
         var m = e.data;
         if (m.type === 'progress') setStatus(m.msg, m.frac);
-        else if (m.type === 'error') fail(m.message);
-        else if (m.type === 'done') { busy = false; $('status').classList.remove('on'); show(m.report, isSample); }
+        else if (m.type === 'error') reject(new Error(m.message));
+        else resolve(m);
       };
-      w.onerror = function (e) { fail('The analysis stopped unexpectedly' + (e && e.message ? ': ' + e.message : '.') + ' Try the 1024 px setting.'); worker = null; };
-      w.postMessage({ rgba: data.buffer, width: cw, height: ch, head: head, name: name, maxSide: maxSide,
-                      orig: { width: W, height: H, x0: x0, y0: y0 } }, [data.buffer, head]);
-    }).catch(function () {
-      fail('This file could not be read as an image. PNG, JPEG, WebP and GIF work in every browser; HEIC and TIFF only in some.');
+      w.onerror = function (e) {
+        worker = null;
+        reject(new Error('The analysis stopped unexpectedly' + (e && e.message ? ': ' + e.message : '.') + ' Try the 1024 px setting.'));
+      };
+      w.postMessage(msg, transfer || []);
     });
+  }
+
+  // central region at 1:1, kept on the 16-pixel grid so block patterns stay aligned
+  function cropRect(W, H, maxSide) {
+    var cw = Math.min(W, maxSide), ch = Math.min(H, maxSide);
+    return { cw: cw, ch: ch,
+             x0: W > maxSide ? Math.floor(Math.floor((W - cw) / 2) / 16) * 16 : 0,
+             y0: H > maxSide ? Math.floor(Math.floor((H - ch) / 2) / 16) * 16 : 0 };
+  }
+  function sizeOf(bmp) { return { W: bmp.width || bmp.naturalWidth, H: bmp.height || bmp.naturalHeight }; }
+  function pixelsOf(bmp, maxSide) {
+    var d = sizeOf(bmp);
+    if (!d.W || !d.H) throw new Error('decode');
+    var r = cropRect(d.W, d.H, maxSide);
+    var cv = document.createElement('canvas');
+    cv.width = r.cw; cv.height = r.ch;
+    var ctx = cv.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' });
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(bmp, r.x0, r.y0, r.cw, r.ch, 0, 0, r.cw, r.ch);
+    var data = ctx.getImageData(0, 0, r.cw, r.ch).data;
+    if (bmp.close) bmp.close();
+    return { data: data, W: d.W, H: d.H, r: r };
+  }
+  var UNREADABLE = 'This file could not be read as an image. PNG, JPEG, WebP and GIF work in every browser; HEIC and TIFF only in some.';
+  function begin() {
+    if (busy) return false;
+    busy = true;
+    $('error').classList.remove('on');
+    return true;
+  }
+  function finish(report, isSample) { busy = false; $('status').classList.remove('on'); show(report, isSample); }
+
+  function analyse(blob, name, isSample) {
+    if (!begin()) return;
+    setStatus('Reading the image', 0.02);
+    var maxSide = parseInt($('size').value, 10) || 1024;
+    Promise.all([decode(blob), blob.slice(0, 1048576).arrayBuffer()]).then(function (r) {
+      var px;
+      try { px = pixelsOf(r[0], maxSide); } catch (e) { throw new Error(UNREADABLE); }
+      return ask({ rgba: px.data.buffer, width: px.r.cw, height: px.r.ch, head: r[1], name: name,
+                   orig: { width: px.W, height: px.H, x0: px.r.x0, y0: px.r.y0 } }, [px.data.buffer, r[1]]);
+    }, function () { throw new Error(UNREADABLE); })
+      .then(function (m) { finish(m.report, isSample); })
+      .catch(function (err) { fail(err.message || String(err)); });
+  }
+
+  // several images: flat-image averaging and noise-residual stacking
+  function analyseStack(files) {
+    if (!begin()) return;
+    var maxSide = parseInt($('size').value, 10) || 1024;
+    var n = files.length, sizes = [], group, orig, rect;
+    var each = function (list, fn) {       // run fn on each item, one after another
+      return list.reduce(function (p, item, i) { return p.then(function () { return fn(item, i); }); }, Promise.resolve());
+    };
+    each(files, function (f, i) {
+      setStatus('Checking sizes (' + (i + 1) + ' of ' + n + ')', 0.05 * (i + 1) / n);
+      return decode(f).then(function (bmp) { var d = sizeOf(bmp); if (bmp.close) bmp.close(); sizes[i] = d.W + 'x' + d.H; },
+                            function () { sizes[i] = null; });
+    }).then(function () {
+      var count = {}, best = null;
+      sizes.forEach(function (k) { if (k) { count[k] = (count[k] || 0) + 1; if (!best || count[k] > count[best]) best = k; } });
+      if (!best) throw new Error(UNREADABLE);
+      group = files.filter(function (f, i) { return sizes[i] === best; });
+      if (group.length < 2) throw new Error('Stacking needs at least two images of the same pixel size. These are all different sizes; choose one image to analyse it alone.');
+      var wh = best.split('x').map(Number);
+      rect = cropRect(wh[0], wh[1], maxSide);
+      orig = { width: wh[0], height: wh[1], x0: rect.x0, y0: rect.y0 };
+      return ask({ type: 'stack-begin', width: rect.cw, height: rect.ch, orig: orig, skipped: n - group.length });
+    }).then(function () {
+      return each(group, function (f, i) {
+        setStatus('Stacking image ' + (i + 1) + ' of ' + group.length, 0.05 + 0.35 * (i + 1) / group.length);
+        return Promise.all([decode(f), f.slice(0, 1048576).arrayBuffer()]).then(function (r) {
+          var px = pixelsOf(r[0], maxSide);
+          return ask({ type: 'stack-add', rgba: px.data.buffer, head: r[1], name: f.name }, [px.data.buffer, r[1]]);
+        });
+      });
+    }).then(function () {
+      setStatus('Scanning the stack', 0.4);
+      return ask({ type: 'stack-analyse' });
+    }).then(function (m) {
+      if (m.type === 'done') return m;
+      return each(group, function (f, i) {
+        setStatus('Checking each image for the patterns (' + (i + 1) + ' of ' + group.length + ')', 0.75 + 0.15 * (i + 1) / group.length);
+        return decode(f).then(function (bmp) {
+          var px = pixelsOf(bmp, maxSide);
+          return ask({ type: 'coh-add', rgba: px.data.buffer }, [px.data.buffer]);
+        });
+      }).then(function () { return ask({ type: 'stack-finish' }); });
+    }).then(function (m) { finish(m.report, false); })
+      .catch(function (err) {
+        var msg = (err && err.message) || '';
+        fail(/^(The |This |Stacking)/.test(msg) ? msg : UNREADABLE);
+      });
   }
 
   function show(rep, isSample) {
@@ -1662,14 +1982,21 @@ self.onmessage = function (e) {
     meta.appendChild(document.createTextNode(rep.meta.name + ' · ' + rep.meta.width + '×' + rep.meta.height + ' px · ' + rep.meta.format));
     if (isSample) meta.appendChild(document.createTextNode(' · a generated picture with a faint ripple, stripes in one area and JPEG compression. Choose your own image to replace it.'));
 
+    var isStack = !!rep.meta.stack;
     var top = el('section', null, [
       meta,
-      figure(canvasOf(rep.overlay), 'The image, muted, with each pattern drawn over it in its colour and amplified so it can be seen. Stripes too fine for this view are shown as a glow where they occur.'),
+      figure(canvasOf(rep.overlay), (isStack ? 'The average of the images' : 'The image') + ', muted, with each pattern drawn over it in its colour and amplified so it can be seen. Stripes too fine for this view are shown as a glow where they occur.'),
       el('ul', { 'class': 'legend' }, rep.legend.map(function (l) {
         return el('li', null, [el('span', { 'class': 'chip', style: 'background:' + rgb(l[1]) }), document.createTextNode(l[0])]);
       }))
     ]);
     root.appendChild(top);
+
+    if (rep.shared && rep.shared.length) {
+      var ssec = el('section', null, [el('h2', { text: 'What the images share' })]);
+      rep.shared.forEach(function (sh) { ssec.appendChild(figure(canvasOf(sh.img, 'pix'), sh.title + '. ' + sh.text)); });
+      root.appendChild(ssec);
+    }
 
     lastSummary = rep.summary.join('\n');
     var copy = el('button', { 'class': 'btn ghost', type: 'button', id: 'copy', text: 'Copy summary' });
@@ -1711,10 +2038,14 @@ self.onmessage = function (e) {
 
     if (rep.table.length) {
       var t = el('table');
-      t.appendChild(el('thead', null, [el('tr', null, ['#', 'Cause', 'Repeat', 'Angle', '±Levels', 'Extent', 'Strength', 'Peaks'].map(function (h) { return el('th', { text: h }); }))]));
+      var heads = ['#', 'Cause', 'Repeat', 'Angle', '±Levels', 'Extent', 'Strength', 'Peaks'];
+      if (isStack) heads.splice(6, 0, 'In all images');
+      t.appendChild(el('thead', null, [el('tr', null, heads.map(function (h) { return el('th', { text: h }); }))]));
       var tb = el('tbody');
       rep.table.forEach(function (r) {
-        tb.appendChild(el('tr', null, [r.n, r.cause, r.repeat, r.angle, r.levels, r.extent, r.strength, r.peaks].map(function (v) { return el('td', { text: String(v) }); })));
+        var cells = [r.n, r.cause, r.repeat, r.angle, r.levels, r.extent, r.strength, r.peaks];
+        if (isStack) cells.splice(6, 0, r.shared || '?');
+        tb.appendChild(el('tr', null, cells.map(function (v) { return el('td', { text: String(v) }); })));
       });
       t.appendChild(tb);
       root.appendChild(el('section', null, [el('h2', { text: 'All patterns' }), el('div', { 'class': 'scroll' }, [t])]));
@@ -1726,18 +2057,28 @@ self.onmessage = function (e) {
       'Whole frame means the pattern has the same strength and alignment in every zone quiet enough to measure. Real subjects such as fabric and fences fail that test; overlays and processing pass it.',
       'One image has limits: a very faint or very slow ripple can hide under busy detail, and a cause is named from the pattern’s geometry, which cannot prove who or what put it there.',
       'Use the original file. A screenshot or a copy re-saved by a chat app has different pixels.'
-    ].concat(rep.notes);
+    ];
+    if (isStack) how = [
+      'Stacking works on what the images have in common. Each picture is different, so its content shrinks as more images are added; a pattern in the same place in every image keeps its full strength.',
+      'Two stacks are made: the plain average of the images (flat-image averaging) and the average of their noise residuals. Both are scanned at every frequency, with the same tests as for one image.',
+      'Each pattern is then looked up in every image separately. If the images agree on its alignment far more than chance allows, it is marked as shared; if not, it comes from individual images.',
+      'Use images of the same pixel size, of different scenes, straight from the same source. Ten to thirty is a good number. Images that are already plain (a white or grey frame) show a shared pattern most directly.'
+    ].concat(how.slice(1));
+    how = how.concat(rep.notes);
     root.appendChild(el('section', null, [el('h2', { text: 'How to read this' }), list(how)]));
   }
 
   function fromFile(f) { if (f) analyse(f, f.name || 'pasted image', false); }
-  $('file').addEventListener('change', function () { fromFile(this.files && this.files[0]); this.value = ''; });
+  function fromFiles(list) {
+    var files = Array.prototype.slice.call(list || []).filter(function (f) { return f; });
+    if (files.length > 1) analyseStack(files); else fromFile(files[0]);
+  }
+  $('file').addEventListener('change', function () { fromFiles(this.files); this.value = ''; });
   var pick = $('pick');
   ['dragenter', 'dragover'].forEach(function (t) { window.addEventListener(t, function (e) { e.preventDefault(); pick.classList.add('over'); }); });
   ['dragleave', 'drop'].forEach(function (t) { window.addEventListener(t, function (e) { e.preventDefault(); pick.classList.remove('over'); }); });
   window.addEventListener('drop', function (e) {
-    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f) fromFile(f);
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) fromFiles(e.dataTransfer.files);
   });
   window.addEventListener('paste', function (e) {
     var items = (e.clipboardData && e.clipboardData.items) || [];

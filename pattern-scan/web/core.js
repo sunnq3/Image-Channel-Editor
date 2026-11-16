@@ -908,8 +908,15 @@ function bestChannel(p) {
 // ---------------------------------------------------------------- main
 function analyzePixels(rgba, W, H, info, opts, progress) {
   opts = opts || {};
-  progress = progress || (() => {});
   const L = loadPixels(rgba, W, H, info, opts.maxSide || 2048);
+  return analyzeChannels(L, info, opts, progress);
+}
+
+/* The analysis proper. L = {chans, rgb, w, h}. opts.res (optional) holds a stacked
+   noise residual per channel, which is scanned as one more source. */
+function analyzeChannels(L, info, opts, progress) {
+  opts = opts || {};
+  progress = progress || (() => {});
   const { chans, rgb, w, h } = L;
   if (Math.min(h, w) < 64) throw new Error('Image is too small to analyse (needs at least 64x64 pixels).');
 
@@ -917,7 +924,20 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
   let allPeaks = [];
   const names = Object.keys(chans);
   let step = 0;
-  const total = names.length * 4;
+  const total = names.length * (opts.res ? 6 : 4);
+  if (opts.res) {
+    for (const kind of ['res', 'resw']) for (const name of names) {
+      if (!opts.res[kind] || !opts.res[kind][name]) continue;
+      progress(`Scanning frequencies (${++step} of ${total})`, 0.05 + 0.6 * step / total);
+      sources[kind + ':' + name] = opts.res[kind][name];
+      const { E, P } = whitenedSpectrum(opts.res[kind][name], w, h, null);
+      const fp = findPeaks(E, P, w, h, 'A', name);
+      for (const p of fp.peaks) { p.weighted = false; p.src = kind; }
+      thresholds['A:' + name + ':' + kind] = fp.thr;
+      allPeaks = allPeaks.concat(fp.peaks);
+      if (name === 'Y' && kind === 'resw') spectra.A = E;
+    }
+  }
   for (const name of names) {
     const x = chans[name];
     const wtFine = flatnessWeight(x, w, h, 3), wtCoarse = flatnessWeight(x, w, h, 15);
@@ -932,7 +952,7 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
       for (const p of fp.peaks) { p.weighted = wt !== null; p.src = kind; }
       thresholds[view + ':' + name + ':' + kind + (wt ? 'w' : '')] = fp.thr;
       allPeaks = allPeaks.concat(fp.peaks);
-      if (name === 'Y' && (kind === 'val' || kind === 'lap') && wt !== null) spectra[view] = E;
+      if (name === 'Y' && (kind === 'val' || kind === 'lap') && wt !== null && !(view === 'A' && opts.res)) spectra[view] = E;
     }
   }
   progress('Measuring patterns', 0.7);
@@ -942,7 +962,12 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
 
   const measurePeak = (p) => {
     const c = bestChannel(p);
-    return measure(sources[p.src + ':' + c], w, h, p.u, p.v, p.weighted ? weights[p.view + ':' + c] : null);
+    const ms = measure(sources[p.src + ':' + c], w, h, p.u, p.v, p.weighted ? weights[p.view + ':' + c] : null);
+    if (p.src === 'res' || p.src === 'resw') {   // undo the residual's high-pass: strength in real levels
+      const g = Math.max(0.1, residualGain(p.u, p.v, p.src === 'res' ? RES_BOX : RES_BOX_WIDE));
+      ms.amp_global /= g; ms.amp_local /= g;
+    }
+    return ms;
   };
 
   const cache = new Map();
@@ -1033,6 +1058,7 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
   patterns.sort((a, b) => b.strength - a.strength);
 
   const fin = [];
+  const droppedInfo = [];
   let dropped = 0;
   for (let nMeasured = 0; nMeasured < patterns.length; nMeasured++) {
     if (fin.length >= 12 || nMeasured >= 24) break;
@@ -1051,7 +1077,7 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
         else pat.category = ms.amplitude < 8.0 ? 'global_faint' : 'global_visible';
       } else {
         ms.amplitude = ms.amp_local;
-        if (ms.amplitude < CFG.MIN_REGIONAL_AMPLITUDE) { dropped++; continue; }
+        if (ms.amplitude < CFG.MIN_REGIONAL_AMPLITUDE) { dropped++; droppedInfo.push({ period: peakPeriod(m), angle: peakAngle(m), src: m.src, score: m.score, amp: ms.amplitude, zones: [ms.zones_present, ms.zones_absent], global: ms.is_global, cat: pat.category }); continue; }
         pat.category = 'regional';
       }
       if (pat.category === 'global_faint' && ms.amplitude < CFG.TRACE_AMPLITUDE) pat.category = 'trace';
@@ -1063,8 +1089,8 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
       if ((pat.category === 'pixel_lattice' || pat.category === 'grid8') && ms.amplitude !== null
           && pat.peaks.every(q => q.view === 'A') && ms.amplitude < CFG.TRACE_AMPLITUDE) pat.category = 'trace';
     }
-    if ((pat.category === 'pixel_lattice' || pat.category === 'grid8') && !ms.is_global && ms.zones_absent >= 3) { dropped++; continue; }
-    if (pat.category === 'resampling' && pat.view === 'B' && !ms.is_global) { dropped++; continue; }
+    if ((pat.category === 'pixel_lattice' || pat.category === 'grid8') && !ms.is_global && ms.zones_absent >= 3) { dropped++; droppedInfo.push({ period: peakPeriod(m), angle: peakAngle(m), src: m.src, score: m.score, amp: ms.amplitude, zones: [ms.zones_present, ms.zones_absent], global: ms.is_global, cat: pat.category }); continue; }
+    if (pat.category === 'resampling' && pat.view === 'B' && !ms.is_global) { dropped++; droppedInfo.push({ period: peakPeriod(m), angle: peakAngle(m), src: m.src, score: m.score, amp: ms.amplitude, zones: [ms.zones_present, ms.zones_absent], global: ms.is_global, cat: pat.category }); continue; }
     if (pat.category === 'resampling') {
       const f = peakFreq(m);
       if (onAxis && f > 0.02 && f < 0.5) {
@@ -1078,10 +1104,138 @@ function analyzePixels(rgba, W, H, info, opts, progress) {
   let thrMax = 0;
   for (const k of Object.keys(thresholds)) thrMax = Math.max(thrMax, thresholds[k]);
   return { info, rgb, w, h, chans, sources, weights, spectra, patterns: fin, jpeg,
-           thr: thrMax, n_scans: total, n_peaks: peaks.length, dropped };
+           thr: thrMax, n_scans: total, n_peaks: peaks.length, dropped, droppedInfo };
 }
 
-const PatternCore = { CFG, CATEGORIES, EXPLAIN, LN2, analyzePixels, parseFileHeader, reconstruct,
+// ---------------------------------------------------------------- stacking several images
+const RES_BOX = 5;                     // fine residual   = image - smooth3(image, 5)
+const RES_BOX_WIDE = 31;               // wide residual   = image - smooth3(image, 31)
+
+/* How much of a wave survives a residual's high-pass (1 = all of it). */
+function residualGain(u, v, box) {
+  const d = (f) => {
+    const a = Math.PI * f;
+    return Math.abs(Math.sin(a)) < 1e-9 ? 1 : Math.sin(a * box) / (box * Math.sin(a));
+  };
+  return 1 - Math.pow(d(u), 3) * Math.pow(d(v), 3);
+}
+
+/* Flat-image averaging and noise-residual stacking.
+   mean      = plain average of the images: each picture's own content shrinks, anything
+               identical in every image stays at full strength;
+   residual  = each image minus a smoothed copy of itself, averaged with more weight where
+               that image is smooth (inverse local variance, as for sensor-noise
+               fingerprints). Two versions: a fine one for narrow stripes and a wide one
+               that keeps slow ripples too. */
+function stackBegin(w, h) {
+  const n = w * h, z = () => new Float64Array(n), trio = () => ({ Y: z(), Cb: z(), Cr: z() });
+  return { w, h, n: 0, colour: false, rgb: new Float64Array(n * 3), sum: trio(),
+           num: trio(), den: trio(), numw: trio(), denw: trio() };
+}
+
+function stackAdd(st, rgba, W, H) {
+  if (W !== st.w || H !== st.h) throw new Error('Stacked images must all be the same size.');
+  const L = loadPixels(rgba, W, H, { notes: [] }, Math.max(W, H));
+  const n = st.w * st.h;
+  for (let i = 0; i < n * 3; i++) st.rgb[i] += L.rgb[i];
+  if (L.chans.Cb) st.colour = true;
+  for (const name of ['Y', 'Cb', 'Cr']) {
+    const x = L.chans[name];
+    if (!x) { for (let i = 0; i < n; i++) st.sum[name][i] += 128; continue; }
+    const sum = st.sum[name];
+    for (let i = 0; i < n; i++) sum[i] += x[i];
+    for (const [box, scale, num, den] of [[RES_BOX, 3, st.num[name], st.den[name]],
+                                          [RES_BOX_WIDE, 15, st.numw[name], st.denw[name]]]) {
+      const sm = smooth3(x, st.w, st.h, box), wt = flatnessWeight(x, st.w, st.h, scale);
+      for (let i = 0; i < n; i++) { num[i] += wt[i] * (x[i] - sm[i]); den[i] += wt[i]; }
+    }
+  }
+  st.n++;
+  return L;
+}
+
+function stackFinish(st) {
+  const n = st.w * st.h, names = st.colour ? ['Y', 'Cb', 'Cr'] : ['Y'];
+  const chans = {}, res = { res: {}, resw: {} };
+  for (const name of names) {
+    const m = new Float64Array(n), r = new Float64Array(n), rw = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      m[i] = st.sum[name][i] / st.n;
+      r[i] = st.den[name][i] > 0 ? st.num[name][i] / st.den[name][i] : 0;
+      rw[i] = st.denw[name][i] > 0 ? st.numw[name][i] / st.denw[name][i] : 0;
+    }
+    chans[name] = m; res.res[name] = r; res.resw[name] = rw;
+  }
+  const rgb = new Float64Array(n * 3);
+  for (let i = 0; i < n * 3; i++) rgb[i] = st.rgb[i] / st.n;
+  return { L: { chans, rgb, w: st.w, h: st.h }, res };
+}
+
+/* One image's amplitude and phase for one wave, over the whole frame. */
+function projectGlobal(src, w, h, u, v, weight) {
+  const box = boxFor(1 / Math.max(hyp(u, v), 1e-9), h, w);
+  const lp = boxFilter(src, w, h, box);
+  const cosx = new Float64Array(w), sinx = new Float64Array(w);
+  for (let x = 0; x < w; x++) { cosx[x] = Math.cos(2 * Math.PI * u * x); sinx[x] = Math.sin(2 * Math.PI * u * x); }
+  // Tapered to zero at the borders: a hard frame edge leaks slow content into every
+  // frequency with the SAME phase in every image, which would fake agreement.
+  const hx = hanning(w), hy = hanning(h);
+  let re = 0, im = 0, sw = 0;
+  for (let y = 0; y < h; y++) {
+    const cy = Math.cos(2 * Math.PI * v * y), sy = Math.sin(2 * Math.PI * v * y), o = y * w;
+    let rr = 0, ri = 0;
+    for (let x = 0; x < w; x++) {
+      const wt = (weight ? weight[o + x] : 1) * hx[x] * hy[y], val = (src[o + x] - lp[o + x]) * wt;
+      rr += val * cosx[x]; ri -= val * sinx[x]; sw += wt;
+    }
+    re += rr * cy + ri * sy; im += ri * cy - rr * sy;      // (rr + i ri) * (cy - i sy)
+  }
+  return [re / sw, im / sw];
+}
+
+/* Second pass: is each pattern there, with the same alignment, in every single image? */
+function coherenceAdd(patterns, L, acc) {
+  const cache = {};
+  const get = (kind, c) => {
+    const k = kind + ':' + c;
+    if (!cache[k]) {
+      const x = L.chans[c];
+      cache[k] = kind === 'lap' ? roughnessLap(x, L.w, L.h) : kind === 'step' ? roughnessStep(x, L.w, L.h)
+        : kind === 'wA' ? flatnessWeight(x, L.w, L.h, 15) : kind === 'wB' ? flatnessWeight(x, L.w, L.h, 3) : x;
+    }
+    return cache[k];
+  };
+  patterns.forEach((pat, i) => {
+    const m = pat.rep, c = L.chans[pat.channel] ? pat.channel : 'Y';
+    const kind = (m.src === 'lap' || m.src === 'step') ? m.src : 'val';
+    const a = projectGlobal(get(kind, c), L.w, L.h, m.u, m.v, get(m.view === 'B' ? 'wB' : 'wA', c));
+    (acc[i] = acc[i] || []).push(a);
+  });
+}
+
+function coherenceFinish(patterns, acc) {
+  patterns.forEach((pat, i) => {
+    const list = acc[i] || [], N = list.length;
+    let ur = 0, ui = 0;
+    const mags = [];
+    for (const [re, im] of list) { const m = hyp(re, im) || 1e-12; ur += re / m; ui += im / m; mags.push(m); }
+    const C = N ? hyp(ur, ui) / N : 0, phi = Math.atan2(ui, ur);
+    let aligned = 0;
+    for (const [re, im] of list) {
+      const m = hyp(re, im) || 1e-12;
+      if ((re * Math.cos(phi) + im * Math.sin(phi)) / m > 0.5) aligned++;   // within 60 degrees
+    }
+    const judged = N >= 5;
+    pat.across = { n: N, coherence: C, chance: N ? 1 / Math.sqrt(N) : 1, aligned,
+                   judged, shared: judged && N * C * C > 4.6 && C >= 0.5 && aligned >= 0.6 * N,
+                   typical_amp: N ? 2 * median(mags) : 0 };
+    // a sub-level ripple that every image carries is a finding, not a stray residue
+    if (pat.category === 'trace' && pat.across.shared) pat.category = 'global_faint';
+  });
+}
+
+const PatternCore = {
+  analyzeChannels, stackBegin, stackAdd, stackFinish, coherenceAdd, coherenceFinish, residualGain, projectGlobal, CFG, CATEGORIES, EXPLAIN, LN2, analyzePixels, parseFileHeader, reconstruct,
   peakPeriod, peakAngle, peakFreq, percentile, median, boxFilter, smooth3, whitenedSpectrum,
   findPeaks, measure, blockBoundaryTest, latticeOf, flatnessWeight, roughnessLap, roughnessStep };
 if (typeof module !== 'undefined' && module.exports) module.exports = PatternCore;
