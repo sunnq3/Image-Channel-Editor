@@ -19,7 +19,22 @@ for something that was added to the picture:
 | green | repeating texture in part of the image | fabric, fences, bricks: real subjects |
 | grey | sub-level trace | a ripple under a third of one brightness step, listed for completeness |
 
-## Use
+## Use it in a browser
+
+Open `index.html`. It is one self-contained file, like the editor in the repo root: choose,
+drop or paste an image and the report appears underneath. It works on a phone. The image
+never leaves the device; all the analysis runs in the page.
+
+The page analyses up to 1024 px per side by default (about 6 s on a laptop, longer on a
+phone) or 2048 px on request. Larger images are read at full resolution from their
+centre, never shrunk.
+
+The browser version is the same analysis as the Python tool, ported line for line
+(`web/core.js`). `python tests/compare_js.py` runs both on the same pixels: on 76 test
+images they produced the same list of findings every time. To rebuild `index.html` after
+changing anything in `web/`, run `python web/build.py`.
+
+## Use it from the command line
 
 ```
 pip install -r requirements.txt
@@ -139,6 +154,12 @@ whole-frame patterns are all there. `--full` analyses up to 4096 px per side ins
 ## Files
 
 ```
+index.html                the browser tool (built from web/)
+web/core.js               the analysis, ported to JavaScript
+web/render.js             report text and pictures for the page
+web/template.html         page layout and controls
+web/build.py              assembles index.html
+tests/compare_js.py       checks the browser core against the Python tool (needs Node.js)
 patternscan/analyze.py    the analysis (spectra, peak finding, measurement, classification)
 patternscan/report.py     pictures and the HTML report
 patternscan/__main__.py   command line
