@@ -75,6 +75,16 @@ table{border-collapse:collapse;font-size:.85rem;width:100%;font-variant-numeric:
 th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
 th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
 .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.verdict{border:1px solid var(--line);border-left:4px solid var(--dim);border-radius:8px;padding:14px 16px;background:var(--panel);display:flex;flex-direction:column;gap:6px}
+.verdict.found{border-left-color:#ff3278}
+.verdict-title{font:600 1.2rem/1.25 var(--body)}
+.verdict p{max-width:66ch}
+.sub{font:500 .78rem/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:6px 0}
+details.routine{border:1px solid var(--line);border-radius:8px;padding:0 14px;background:var(--panel)}
+details.routine[open]{padding-bottom:14px}
+details.routine summary{cursor:pointer;padding:12px 0;font:500 .82rem var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+details.routine summary:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+.rrow{padding:10px 0;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:4px;font-size:.92rem}
 .tag{display:inline-block;font:500 .72rem var(--mono);letter-spacing:.1em;text-transform:uppercase;
      color:#17130a;background:var(--signal);border-radius:3px;padding:3px 7px}
 @media (max-width:420px){dl{grid-template-columns:1fr;gap:0 0}dd{margin-bottom:6px}}
@@ -85,7 +95,7 @@ th{font:400 .72rem var(--mono);color:var(--dim);text-transform:uppercase;letter-
 <main>
 <header>
   <h1>Pattern Scan</h1>
-  <p class="lede">Finds repeating patterns in an image at every stripe width and direction, draws them on the picture, and says what each one most likely is: JPEG blocks, a resize trace, a faint overlay, or real texture. Give it several images and it stacks them to bring out a pattern they all carry.</p>
+  <p class="lede">Looks for watermark-like patterns: faint regular ripples laid over a whole image. One image gets scanned at every stripe width and direction. Several images get stacked, which fades the pictures and leaves the pattern they all carry. Compression blocks and resize traces are recognised and set aside.</p>
 </header>
 
 <div class="pick" id="pick">
@@ -1215,7 +1225,10 @@ function analyzeChannels(L, info, opts, progress) {
   }
   let thrMax = 0;
   for (const k of Object.keys(thresholds)) thrMax = Math.max(thrMax, thresholds[k]);
-  return { info, rgb, w, h, chans, sources, weights, spectra, patterns: fin, jpeg,
+  // Added (view A) components that sit exactly on a pixel-lattice frequency. In one image
+  // they cannot be told from compression; a stack of images can tell (promoteSharedLattice).
+  const latticeCands = latA.filter(q => q.lattice).map(q => ({ rep: q, channel: bestChannel(q), measure: cache.get(q) }));
+  return { info, rgb, w, h, chans, sources, weights, spectra, patterns: fin, jpeg, latticeCands,
            thr: thrMax, n_scans: total, n_peaks: peaks.length, dropped, droppedInfo };
 }
 
@@ -1346,7 +1359,63 @@ function coherenceFinish(patterns, acc) {
   });
 }
 
+/* Compression blocks differ from picture to picture, so their added brightness averages
+   away in a stack; only their rhythm in roughness remains. An added component on a lattice
+   frequency that keeps the same alignment in every image is therefore not compression:
+   it is promoted to an overlay pattern of its own. */
+const LATTICE_OVERLAY_MIN = 0.25;       // brightness levels
+function promoteSharedLattice(res) {
+  let promoted = 0;
+  for (const c of res.latticeCands || []) {
+    const a = c.across, ms = c.measure;
+    // JPEG decoding itself leaves a fixed rounding ripple of about 0.1 level on these
+    // frequencies in every image, so only clearly stronger components are promoted.
+    if (!a || !a.shared || !ms || !ms.is_global || ms.amp_global < LATTICE_OVERLAY_MIN) continue;
+    for (const pat of res.patterns) {
+      const i = pat.peaks.indexOf(c.rep);
+      if (i >= 0 && pat.rep !== c.rep) pat.peaks.splice(i, 1);
+    }
+    if (res.patterns.some(pat => pat.rep === c.rep)) continue;      // already a pattern's main wave
+    ms.amplitude = ms.amp_global;
+    res.patterns.push({
+      category: ms.amplitude < 8 ? 'global_faint' : 'global_visible', peaks: [c.rep], strength: c.rep.score,
+      channel: c.channel, view: 'A', measure: ms, weighted: !!c.rep.weighted, rep: c.rep, across: a,
+      notes: ['It sits exactly on a ' + c.rep.lattice + '-pixel lattice frequency, where compression also leaves marks. It is listed as an overlay because every image carries it with the same alignment, which compression blocks do not do.'],
+    });
+    promoted++;
+  }
+  res.patterns.sort((x, y) => y.strength - x.strength);
+  return promoted;
+}
+
+/* Every wave of one pattern: strength and phase, measured over the whole frame. */
+function carrierInfo(res, pat, limit) {
+  const out = [];
+  const waves = pat.peaks.filter(q => q.view === 'A').sort((a, b) => b.score - a.score).slice(0, limit || 8);
+  for (const q of waves) {
+    const c = res.chans[pat.channel] ? pat.channel : 'Y';
+    const isRes = q.src === 'res' || q.src === 'resw';
+    const a = projectGlobal(res.sources[q.src + ':' + c], res.w, res.h, q.u, q.v, isRes ? null : res.weights['A:' + c]);
+    const g = isRes ? Math.max(0.1, residualGain(q.u, q.v, q.src === 'res' ? RES_BOX : RES_BOX_WIDE)) : 1;
+    out.push({ period: peakPeriod(q), angle: peakAngle(q), u: q.u, v: q.v, bx: q.bx, by: q.by,
+               amp: 2 * hyp(a[0], a[1]) / g, phase: Math.atan2(a[1], a[0]) * 180 / Math.PI,
+               times: q.score / LN2, lattice: q.lattice });
+  }
+  return out;
+}
+
+/* Strength of a pattern's main wave in each colour channel. */
+function channelAmps(res, pat) {
+  const m = pat.rep, out = {};
+  for (const c of Object.keys(res.chans)) {
+    const a = projectGlobal(res.chans[c], res.w, res.h, m.u, m.v, res.weights['A:' + c]);
+    out[c] = 2 * hyp(a[0], a[1]);
+  }
+  return out;
+}
+
 const PatternCore = {
+  promoteSharedLattice, carrierInfo, channelAmps,
   analyzeChannels, stackBegin, stackAdd, stackFinish, coherenceAdd, coherenceFinish, residualGain, projectGlobal, CFG, CATEGORIES, EXPLAIN, LN2, analyzePixels, parseFileHeader, reconstruct,
   peakPeriod, peakAngle, peakFreq, percentile, median, boxFilter, smooth3, whitenedSpectrum,
   findPeaks, measure, blockBoundaryTest, latticeOf, flatnessWeight, roughnessLap, roughnessStep };
@@ -1615,52 +1684,144 @@ if (typeof self !== 'undefined') self.PatternCore = PatternCore;
   }
 
   // ------------------------------------------------------------ assemble
+  const WM = ['global_faint', 'global_visible', 'trace'];           // watermark-like: the focus
+  const ROUTINE = ['jpeg_grid', 'chroma_grid', 'grid8', 'pixel_lattice', 'resampling'];
+  const CH_NAMES = { Y: 'brightness', Cb: 'blue-yellow', Cr: 'red-green' };
+
+  function fullWave(res, pat) {            // the pattern by itself, full frame, in levels
+    const m = pat.rep, src = res.sources[m.src + ':' + pat.channel];
+    const lim = res.w * res.h > 1.2e6 ? 2 : 4;
+    const same = pat.peaks.filter(p => p.view === m.view).sort((a, b) => b.score - a.score).slice(0, lim);
+    return reconstruct(src, res.w, res.h, same.map(p => [p.u, p.v]), 0, 0, res.h, res.w);
+  }
+  function waveAlpha(res, pat, base, wave) {
+    if (!wave || peakPeriod(pat.rep) * base.scale < 3.0) return envelopeAlpha(pat, base.w, base.h);
+    const top = percentile(Float64Array.from(wave, Math.abs), 97) || 1;
+    const a = Float64Array.from(wave, v => Math.min(1, Math.max(0, v / top)));
+    return downscaleGray(a, res.w, res.h, base.w, base.h);
+  }
+  function patternAlone(res, pat, wave) {  // central region at 1:1, amplified, in the pattern's colour
+    const cw = Math.min(res.w, MAX_DISPLAY), ch = Math.min(res.h, MAX_DISPLAY);
+    const x0 = (res.w - cw) >> 1, y0 = (res.h - ch) >> 1;
+    const top = percentile(Float64Array.from(wave, Math.abs), 97) || 1e-9, gain = 100 / top;
+    const col = CATEGORIES[pat.category][1], data = new Uint8ClampedArray(cw * ch * 4);
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+      const t = Math.min(1, Math.max(-1, wave[(y + y0) * res.w + x + x0] * gain / 100)), d = (y * cw + x) * 4;
+      for (let k = 0; k < 3; k++) data[d + k] = u8(128 + t * 110 * (0.35 + 0.65 * col[k] / 255));
+      data[d + 3] = 255;
+    }
+    return { img: { w: cw, h: ch, data }, gain };
+  }
+  function describe(p) {
+    const amp = p.measure.amplitude;
+    return `a ripple every ${periodText(p)}` + ((amp !== null && amp !== undefined) ? `, ±${amp.toFixed(amp < 1 ? 2 : 1)} brightness levels` : '')
+      + (p.measure.is_global ? ', across the whole frame' : '');
+  }
+  function verdict(res, wm) {
+    const strong = wm.filter(p => p.category !== 'trace'), traces = wm.filter(p => p.category === 'trace');
+    const st = res.stack;
+    if (st) {
+      const shared = strong.filter(p => p.across && p.across.shared);
+      if (shared.length) {
+        return { found: true, title: shared.length === 1 ? 'Shared watermark-like pattern found' : `${shared.length} shared watermark-like patterns found`,
+                 text: `All ${st.n} images carry ${describe(shared[0])}, in the same position in each. Compression and resizing do not explain it.`
+                   + (shared.length > 1 ? ` ${shared.length - 1} more below.` : '') };
+      }
+      if (strong.length) {
+        return { found: false, title: 'No shared watermark-like pattern',
+                 text: st.n < 5 ? `A whole-frame ripple shows in the stack, but ${st.n} images are too few to tell whether they all carry it. Use at least 5, ideally 10 to 30.`
+                   : `A whole-frame ripple shows in the stack, but the ${st.n} images do not agree on its position, so it comes from individual images and is not a mark they all carry.` };
+      }
+      return { found: false, title: 'No shared watermark-like pattern',
+               text: `Nothing regular survives the stack of ${st.n} images apart from routine processing traces.`
+                 + (st.n < 10 ? ' More images would look deeper: each picture fades by the square root of the count.' : '') };
+    }
+    if (strong.length) {
+      return { found: true, title: strong.length === 1 ? 'Watermark-like pattern found' : `${strong.length} watermark-like patterns found`,
+               text: `The image carries ${describe(strong[0])}. Compression and resizing do not explain it.`
+                 + (strong.length > 1 ? ` ${strong.length - 1} more below.` : '')
+                 + ' To check that it is a fixed mark and not part of this one picture, stack several images from the same source.' };
+    }
+    if (traces.length) {
+      return { found: false, title: 'Only sub-level candidates',
+               text: `${traces.length} very faint whole-frame ripple${traces.length > 1 ? 's' : ''} under 0.3 of a brightness level. That is too weak to call from one image. Stack 10 or more images from the same source to settle it.` };
+    }
+    return { found: false, title: 'No watermark-like pattern found',
+             text: 'No whole-frame ripple stands out in this image. One image can hide a faint or wide one under its own detail; stacking 10 or more images from the same source looks much deeper.' };
+  }
+
   function buildReport(res, progress) {
     progress = progress || (() => {});
     const info = res.info, pats = res.patterns;
     const base = downscaleRGB(res.rgb, res.w, res.h, MAX_DISPLAY);
     const small = downscaleRGB(res.rgb, res.w, res.h, MAX_WHERE);
-    const shown = pats.slice(0, MAX_CARDS);
-    const anyReal = shown.some(p => p.category !== 'trace');
+    const wm = pats.filter(p => WM.includes(p.category))
+      .sort((a, b) => ((a.category === 'trace') - (b.category === 'trace')) || (b.strength - a.strength));
+    const other = pats.filter(p => p.category === 'regional');
+    const routine = pats.filter(p => ROUTINE.includes(p.category));
+    const wmShown = wm.slice(0, 6), otherShown = other.slice(0, 3);
+    const anyStrong = wm.some(p => p.category !== 'trace');
 
-    const layers = [];
-    const ordered = shown.slice().sort((a, b) => (LATTICE_CATS.includes(a.category) ? 0 : 1) - (LATTICE_CATS.includes(b.category) ? 0 : 1));
-    let k = 0;
-    for (const pat of ordered) {
-      if (pat.category === 'trace' && anyReal) continue;
-      progress(`Drawing patterns (${++k})`, 0.86 + 0.06 * k / Math.max(1, ordered.length));
-      const op = (LATTICE_CATS.includes(pat.category) || pat.category === 'resampling') ? 0.22 : 0.85;
-      layers.push([stripesAlpha(res, pat, base), CATEGORIES[pat.category][1], op]);
-    }
-    const overlay = layers.length ? tint(base, layers) : plain(base);
-
-    const cards = [];
-    shown.forEach((pat, i) => {
-      progress(`Preparing pattern ${i + 1}`, 0.92 + 0.07 * i / Math.max(1, shown.length));
+    const makeCard = (pat, n, isWm) => {
       const [label, col] = CATEGORIES[pat.category];
       const where = tint(small, [[envelopeAlpha(pat, small.w, small.h), col, 0.85]]);
       const zp = zoomPair(res, pat);
-      const kind = pat.rep.view === 'A' ? 'pattern isolated and amplified' : 'roughness rhythm isolated and amplified';
-      cards.push({
-        n: i + 1, label, color: col, explain: EXPLAIN[pat.category], notes: pat.notes,
-        fields: [['Repeats every', periodText(pat)], ['Direction', directionText(pat)],
-                 ['Strength', strengthText(pat)]].concat(acrossText(pat) ? [['Across images', acrossText(pat)]] : []).concat([['Where', whereText(pat)],
-                 ['Found in', channelsText(pat)], ['Confidence', confidenceText(pat, res.thr)],
-                 ['Spectral peaks', String(pat.peaks.length)]]),
-        where, zoomLeft: zp.left, zoomRight: zp.right,
-        zoomCaption: `Zoom on a ${zp.size}×${zp.size}-pixel patch at (${zp.x0}, ${zp.y0}), shown ${ZOOM}×. Left: the picture${zp.grid ? ' with the block grid drawn in' : ''}. Right: ${kind} ${zp.gain.toFixed(0)}×.`,
-      });
+      const fields = [['Repeats every', periodText(pat)], ['Direction', directionText(pat)], ['Strength', strengthText(pat)]];
+      if (acrossText(pat)) fields.push(['Across images', acrossText(pat)]);
+      fields.push(['Where', whereText(pat)]);
+      let carriers = null;
+      if (isWm) {
+        const amps = C.channelAmps(res, pat);
+        fields.push(['By channel', Object.keys(amps).map(c => `${CH_NAMES[c]} ±${amps[c].toFixed(2)}`).join(', ')]);
+        carriers = C.carrierInfo(res, pat, 8).map(q => ({
+          period: `${q.period.toFixed(2)} px`, angle: `${q.angle.toFixed(1)}°`,
+          freq: `${q.u >= 0 ? '+' : '−'}${Math.abs(q.u).toFixed(4)}, ${q.v >= 0 ? '+' : '−'}${Math.abs(q.v).toFixed(4)}`,
+          bin: `${Math.round(q.bx)}, ${Math.round(q.by)}`, levels: `±${q.amp.toFixed(2)}`,
+          phase: `${q.phase.toFixed(0)}°`, strength: `${fmt0(q.times)}×`,
+        }));
+      }
+      fields.push(['Confidence', confidenceText(pat, res.thr)]);
+      return {
+        n, label, color: col, explain: EXPLAIN[pat.category], notes: pat.notes, fields, carriers, where,
+        zoomLeft: zp.left, zoomRight: zp.right,
+        zoomCaption: `Zoom on a ${zp.size}×${zp.size}-pixel patch at (${zp.x0}, ${zp.y0}), shown ${ZOOM}×. Left: the picture. Right: pattern isolated and amplified ${zp.gain.toFixed(0)}×.`,
+      };
+    };
+
+    // main picture: only what was added to the image (watermark-like first), never the routine traces
+    const layers = [], cards = [], otherCards = [];
+    wmShown.forEach((pat, i) => {
+      progress(`Drawing pattern ${i + 1}`, 0.86 + 0.1 * i / Math.max(1, wmShown.length + otherShown.length));
+      const card = makeCard(pat, i + 1, true);
+      const wave = fullWave(res, pat);
+      const alone = patternAlone(res, pat, wave);
+      card.alone = alone.img;
+      card.aloneCaption = `The pattern by itself over the ${alone.img.w < res.w || alone.img.h < res.h ? 'central ' + alone.img.w + '×' + alone.img.h + ' pixels' : 'whole frame'}, picture removed, amplified ${alone.gain.toFixed(0)}×.`;
+      if (pat.category !== 'trace' || !anyStrong) layers.push([waveAlpha(res, pat, base, wave), CATEGORIES[pat.category][1], 0.85]);
+      cards.push(card);
     });
+    otherShown.forEach((pat, i) => {
+      progress(`Drawing pattern ${wmShown.length + i + 1}`, 0.86 + 0.1 * (wmShown.length + i) / Math.max(1, wmShown.length + otherShown.length));
+      otherCards.push(makeCard(pat, i + 1, false));
+      layers.push([waveAlpha(res, pat, base, fullWave(res, pat)), CATEGORIES[pat.category][1], 0.7]);
+    });
+    const overlay = layers.length ? tint(base, layers) : plain(base);
 
     const legend = [];
-    for (const p of shown) if (!legend.some(l => l[0] === CATEGORIES[p.category][0])) legend.push(CATEGORIES[p.category]);
+    for (const p of wmShown.concat(otherShown)) if (!legend.some(l => l[0] === CATEGORIES[p.category][0])) legend.push(CATEGORIES[p.category]);
+
+    const routineRows = routine.map(p => ({
+      label: CATEGORIES[p.category][0], color: CATEGORIES[p.category][1], repeat: periodText(p),
+      strength: `${fmt0(p.strength / LN2)}×`, explain: EXPLAIN[p.category], notes: p.notes,
+    }));
 
     const spectra = [];
+    const marked = wm.concat(other, routine);
     for (const [view, title, text] of [
-      ['A', 'Frequency map of the pixel values', 'Each point is one stripe width and direction: the centre is slow change, the edges are 2-pixel stripes. The picture\'s own content has been divided out, so an even grey means nothing regular; a bright dot is a repeating pattern.'],
-      ['B', 'Frequency map of the roughness', 'The same map for how rough the image is from pixel to pixel. Compression blocks and resizing show up here even though they add no visible pattern.']]) {
+      ['A', 'Frequency map of the pixel values', 'Each point is one stripe width and direction: the centre is slow change, the edges are 2-pixel stripes. The picture\'s own content has been divided out, so an even grey means nothing regular; a bright dot is a repeating pattern. Watermark carriers show up here.'],
+      ['B', 'Frequency map of the roughness', 'The same map for how rough the image is from pixel to pixel. Compression blocks and resizing show up here, not in the map above.']]) {
       if (res.spectra[view]) {
-        const sp = spectrumImage(res.spectra[view], res.w, res.h, shown, view, 640);
+        const sp = spectrumImage(res.spectra[view], res.w, res.h, view === 'A' ? wm.concat(other) : marked, view, 640);
         spectra.push({ title, text, img: sp.img, marks: sp.marks });
       }
     }
@@ -1680,7 +1841,7 @@ if (typeof self !== 'undefined') self.PatternCore = PatternCore;
           data[i * 4] = g; data[i * 4 + 1] = g; data[i * 4 + 2] = g; data[i * 4 + 3] = 255;
         }
         shared.push({ title, img: { w: cw, h: ch, data },
-          text: `${text} Brightness differences are amplified ${gain >= 10 ? gain.toFixed(0) : gain.toFixed(1)}\u00d7.` });
+          text: `${text} Brightness differences are amplified ${gain >= 10 ? gain.toFixed(0) : gain.toFixed(1)}×.` });
       };
       const mY = res.chans.Y, lp = C.smooth3(mY, res.w, res.h, 31), det = new Float64Array(mY.length);
       for (let i = 0; i < det.length; i++) det[i] = mY[i] - lp[i];
@@ -1698,19 +1859,43 @@ if (typeof self !== 'undefined') self.PatternCore = PatternCore;
       strength: `${fmt0(p.strength / LN2)}×`, peaks: p.peaks.length,
     }));
 
+    const v = verdict(res, wm);
+    const summary = [v.title + '. ' + v.text];
+    if (res.stack) summary.push(`${res.stack.n} images of ${res.w}×${res.h} px were stacked (plain average and noise residuals).`);
+    for (const p of wm) {
+      let bit = `${CATEGORIES[p.category][0]}: every ${periodText(p)}, ${directionText(p)}`;
+      const amp = p.measure.amplitude;
+      if (amp !== null && amp !== undefined) bit += `, ±${amp.toFixed(2)} levels`;
+      bit += p.measure.is_global ? ', whole frame.' : ', part of the frame.';
+      if (p.across && p.across.judged) bit += p.across.shared ? ' In every image.' : ' Not shared by the images.';
+      summary.push(bit);
+    }
+    for (const p of other) summary.push(`Repeating texture in part of the image: every ${periodText(p)}, ±${p.measure.amplitude.toFixed(1)} levels. A real subject, not an overlay.`);
+    if (routine.length) {
+      const names = [];
+      for (const p of routine) if (!names.includes(CATEGORIES[p.category][0])) names.push(CATEGORIES[p.category][0]);
+      summary.push(`Routine processing traces, listed at the end: ${names.join('; ')}.`);
+    }
+
     const notes = info.notes.slice();
+    const nLat = (res.latticeCands || []).length;
+    if (nLat && !res.stack) notes.push(`${nLat} added component${nLat > 1 ? 's sit' : ' sits'} exactly on a 2-, 4-, 8- or 16-pixel frequency, where compression leaves marks too. One image cannot tell a mark placed there from compression; a stack of images can.`);
+    if (nLat && res.stack) notes.push('Added components on 2-, 4-, 8- or 16-pixel frequencies were checked in every image. Those weaker than 0.25 of a level were left with the compression traces, because decoding a JPEG leaves a fixed ripple of about 0.1 level there by itself.');
     if (res.dropped) notes.push(`${res.dropped} weak rhythm(s) were set aside because they are confined to one part of the frame (long straight edges and local textures do this).`);
-    if (pats.length > shown.length) notes.push(`Only the ${shown.length} strongest patterns are illustrated; all are in the table.`);
+    if (wm.length > wmShown.length) notes.push(`Only the ${wmShown.length} strongest watermark-like patterns are illustrated; all are in the table.`);
 
     const fmt = info.format + (info.jpeg_quality ? `, quality ≈ ${info.jpeg_quality}` : '');
     const report = {
-      meta: { name: info.path, width: info.width, height: info.height, format: fmt, scans: res.n_scans,
-              stack: res.stack || null },
-      overlay, legend, summary: summaryLines(res), cards, history: historyLines(res), spectra, table, notes, shared,
+      meta: { name: info.path, width: info.width, height: info.height, format: fmt, scans: res.n_scans, stack: res.stack || null },
+      verdict: v, overlay, legend, summary, cards, otherCards, routine: routineRows, history: historyLines(res),
+      spectra, table, notes, shared,
     };
     const transfer = [overlay.data.buffer];
     for (const sh of shared) transfer.push(sh.img.data.buffer);
-    for (const c of cards) transfer.push(c.where.data.buffer, c.zoomLeft.data.buffer, c.zoomRight.data.buffer);
+    for (const c of cards.concat(otherCards)) {
+      transfer.push(c.where.data.buffer, c.zoomLeft.data.buffer, c.zoomRight.data.buffer);
+      if (c.alone) transfer.push(c.alone.data.buffer);
+    }
     for (const s of spectra) transfer.push(s.img.data.buffer);
     return { report, transfer };
   }
@@ -1732,7 +1917,8 @@ function fail(err) {
   stack = null;
 }
 function finishStack() {
-  self.PatternCore.coherenceFinish(stack.res.patterns, stack.acc);
+  self.PatternCore.coherenceFinish(stack.list, stack.acc);
+  self.PatternCore.promoteSharedLattice(stack.res);
   for (var i = 0; i < stack.res.patterns.length; i++) {
     var pat = stack.res.patterns[i], a = pat.across;
     if (a && a.judged && !a.shared) pat.notes.push('The images do not agree on this one, so it is not a mark they all carry. One or a few images contain it strongly enough to show through the average.');
@@ -1770,11 +1956,12 @@ self.onmessage = function (e) {
       res.stack = { n: n, skipped: stack.skipped };
       res.stackRes = fin.res;
       stack.res = res;
-      if (!res.patterns.length) finishStack();
+      stack.list = res.patterns.concat(res.latticeCands);   // everything to look up in each image
+      if (!stack.list.length) finishStack();
       else self.postMessage({ type: 'need-pass2' });
     } else if (d.type === 'coh-add') {
       var L = core.stackAdd(core.stackBegin(stack.res.w, stack.res.h), new Uint8ClampedArray(d.rgba), stack.res.w, stack.res.h);
-      core.coherenceAdd(stack.res.patterns, L, stack.acc);
+      core.coherenceAdd(stack.list, L, stack.acc);
       self.postMessage({ type: 'ack' });
     } else if (d.type === 'stack-finish') {
       finishStack();
@@ -1974,18 +2161,49 @@ self.onmessage = function (e) {
       });
   }
 
+  function cardNode(c) {
+    var dl = el('dl');
+    c.fields.forEach(function (f) { dl.appendChild(el('dt', { text: f[0] })); dl.appendChild(el('dd', { text: f[1] })); });
+    var kids = [el('h3', { text: c.n + '. ' + c.label }), el('p', { text: c.explain })];
+    c.notes.forEach(function (n) { kids.push(el('p', { 'class': 'note', text: n })); });
+    kids.push(dl);
+    if (c.alone) kids.push(figure(canvasOf(c.alone), c.aloneCaption));
+    if (c.carriers && c.carriers.length) {
+      var t = el('table');
+      t.appendChild(el('thead', null, [el('tr', null, ['Stripe width', 'Angle', '±Levels', 'Phase', 'Frequency (cycles/px)', 'Map position', 'Strength'].map(function (h) { return el('th', { text: h }); }))]));
+      var tb = el('tbody');
+      c.carriers.forEach(function (q) {
+        tb.appendChild(el('tr', null, [q.period, q.angle, q.levels, q.phase, q.freq, q.bin, q.strength].map(function (v) { return el('td', { text: v }); })));
+      });
+      t.appendChild(tb);
+      kids.push(el('div', null, [
+        el('p', { 'class': 'sub', text: 'Carrier waves (' + c.carriers.length + ')' }),
+        el('div', { 'class': 'scroll' }, [t]),
+        el('p', { 'class': 'hint', text: 'Each row is one wave the pattern is built from. Phase is where its crests sit, measured from the top-left pixel; map position is its dot in the frequency map, counted from the centre.' })
+      ]));
+    }
+    kids.push(figure(canvasOf(c.where), 'Where it is: brighter colour means the pattern is measured more clearly there.'));
+    kids.push(figure(el('div', { 'class': 'pair' }, [canvasOf(c.zoomLeft, 'pix'), canvasOf(c.zoomRight, 'pix')]), c.zoomCaption));
+    return el('div', { 'class': 'card', style: '--c:' + rgb(c.color) }, kids);
+  }
+
   function show(rep, isSample) {
     var root = $('report');
     root.textContent = '';
+    var isStack = !!rep.meta.stack;
     var meta = el('p', { 'class': 'meta' });
     if (isSample) { meta.appendChild(el('span', { 'class': 'tag', text: 'Sample' })); meta.appendChild(document.createTextNode(' ')); }
     meta.appendChild(document.createTextNode(rep.meta.name + ' · ' + rep.meta.width + '×' + rep.meta.height + ' px · ' + rep.meta.format));
-    if (isSample) meta.appendChild(document.createTextNode(' · a generated picture with a faint ripple, stripes in one area and JPEG compression. Choose your own image to replace it.'));
+    if (isSample) meta.appendChild(document.createTextNode(' · a generated picture with a faint ripple added over the whole frame. Choose your own image to replace it.'));
 
-    var isStack = !!rep.meta.stack;
-    var top = el('section', null, [
-      meta,
-      figure(canvasOf(rep.overlay), (isStack ? 'The average of the images' : 'The image') + ', muted, with each pattern drawn over it in its colour and amplified so it can be seen. Stripes too fine for this view are shown as a glow where they occur.'),
+    var verdict = el('div', { 'class': 'verdict' + (rep.verdict.found ? ' found' : '') }, [
+      el('p', { 'class': 'verdict-title', text: rep.verdict.title }),
+      el('p', { text: rep.verdict.text })
+    ]);
+    var top = el('section', null, [meta, verdict,
+      figure(canvasOf(rep.overlay), rep.legend.length
+        ? (isStack ? 'The average of the images' : 'The image') + ', muted, with each added pattern drawn over it in its colour and amplified so it can be seen. Stripes too fine for this view are shown as a glow where they occur.'
+        : (isStack ? 'The average of the images.' : 'The image.') + ' Nothing to draw: no added pattern was found.'),
       el('ul', { 'class': 'legend' }, rep.legend.map(function (l) {
         return el('li', null, [el('span', { 'class': 'chip', style: 'background:' + rgb(l[1]) }), document.createTextNode(l[0])]);
       }))
@@ -2005,24 +2223,18 @@ self.onmessage = function (e) {
       try { navigator.clipboard.writeText(lastSummary).then(function () { done('Copied'); }, function () { done('Copy not allowed here'); }); }
       catch (e) { done('Copy not allowed here'); }
     });
-    root.appendChild(el('section', null, [el('h2', { text: 'Report' }), list(rep.summary, 'summary'), el('div', { 'class': 'actions' }, [copy])]));
+    root.appendChild(el('section', null, [el('h2', { text: 'Report' }), list(rep.summary.slice(1)), el('div', { 'class': 'actions' }, [copy])]));
 
     if (rep.cards.length) {
-      var sec = el('section', null, [el('h2', { text: 'Each pattern' })]);
-      rep.cards.forEach(function (c) {
-        var dl = el('dl');
-        c.fields.forEach(function (f) { dl.appendChild(el('dt', { text: f[0] })); dl.appendChild(el('dd', { text: f[1] })); });
-        var kids = [el('h3', { text: c.n + '. ' + c.label }), el('p', { text: c.explain })];
-        c.notes.forEach(function (n) { kids.push(el('p', { 'class': 'note', text: n })); });
-        kids.push(dl);
-        kids.push(figure(canvasOf(c.where), 'Where it is: brighter colour means the pattern is measured more clearly there.'));
-        kids.push(figure(el('div', { 'class': 'pair' }, [canvasOf(c.zoomLeft, 'pix'), canvasOf(c.zoomRight, 'pix')]), c.zoomCaption));
-        sec.appendChild(el('div', { 'class': 'card', style: '--c:' + rgb(c.color) }, kids));
-      });
+      var sec = el('section', null, [el('h2', { text: 'Watermark-like patterns' })]);
+      rep.cards.forEach(function (c) { sec.appendChild(cardNode(c)); });
       root.appendChild(sec);
     }
-
-    root.appendChild(el('section', null, [el('h2', { text: 'Compression history' }), list(rep.history)]));
+    if (rep.otherCards.length) {
+      var osec = el('section', null, [el('h2', { text: 'Repeating texture in the picture' })]);
+      rep.otherCards.forEach(function (c) { osec.appendChild(cardNode(c)); });
+      root.appendChild(osec);
+    }
 
     var fsec = el('section', null, [el('h2', { text: 'Frequency maps' })]);
     rep.spectra.forEach(function (s) {
@@ -2032,9 +2244,24 @@ self.onmessage = function (e) {
         ctx.strokeStyle = rgb(m.color);
         ctx.beginPath(); ctx.arc(m.x, m.y, Math.max(5, s.img.w / 90), 0, 2 * Math.PI); ctx.stroke();
       });
-      fsec.appendChild(figure(cv, s.title + '. ' + s.text + ' Circles mark the detected peaks in the colours above.'));
+      fsec.appendChild(figure(cv, s.title + '. ' + s.text + ' Circles mark the detected peaks.'));
     });
     root.appendChild(fsec);
+
+    // routine processing: always there, kept out of the way
+    var det = el('details', { 'class': 'routine' });
+    det.appendChild(el('summary', { text: 'Routine processing traces (' + rep.routine.length + ')' }));
+    det.appendChild(el('p', { 'class': 'hint', text: 'Compression blocks, pixel lattices and resize rhythms. Nearly every image has some. They are identified so they are not mistaken for an added pattern, and kept out of the picture above.' }));
+    rep.routine.forEach(function (r) {
+      var kids = [el('p', null, [el('span', { 'class': 'chip', style: 'background:' + rgb(r.color) }),
+        el('b', { text: r.label }), document.createTextNode(' · every ' + r.repeat + ' · ' + r.strength + ' background')]),
+        el('p', { 'class': 'hint', text: r.explain })];
+      r.notes.forEach(function (n) { kids.push(el('p', { 'class': 'hint', text: n })); });
+      det.appendChild(el('div', { 'class': 'rrow' }, kids));
+    });
+    det.appendChild(el('p', { 'class': 'sub', text: 'Compression history' }));
+    det.appendChild(list(rep.history));
+    root.appendChild(el('section', null, [det]));
 
     if (rep.table.length) {
       var t = el('table');
@@ -2048,22 +2275,23 @@ self.onmessage = function (e) {
         tb.appendChild(el('tr', null, cells.map(function (v) { return el('td', { text: String(v) }); })));
       });
       t.appendChild(tb);
-      root.appendChild(el('section', null, [el('h2', { text: 'All patterns' }), el('div', { 'class': 'scroll' }, [t])]));
+      var tdet = el('details', { 'class': 'routine' }, [el('summary', { text: 'Everything found (' + rep.table.length + ')' }), el('div', { 'class': 'scroll' }, [t])]);
+      root.appendChild(el('section', null, [tdet]));
     }
 
     var how = [
-      'Every stripe width from 2 pixels up to a third of the image, in every direction, was tested in brightness and in both colour channels: ' + rep.meta.scans + ' scans in all.',
-      'A pattern is reported only when it stands far above what the picture’s own detail produces at neighbouring frequencies. Strength is that ratio.',
-      'Whole frame means the pattern has the same strength and alignment in every zone quiet enough to measure. Real subjects such as fabric and fences fail that test; overlays and processing pass it.',
-      'One image has limits: a very faint or very slow ripple can hide under busy detail, and a cause is named from the pattern’s geometry, which cannot prove who or what put it there.',
+      'A watermark-like pattern here means a regular ripple added to the pixel values over the whole frame, with the same alignment everywhere, that compression blocks, pixel lattices and resizing do not explain.',
+      'Every stripe width from 2 pixels up to a third of the image, in every direction, was tested in brightness and in both colour channels: ' + rep.meta.scans + ' scans in all. A pattern is reported only when it stands far above what the picture’s own detail produces at neighbouring frequencies.',
+      'The tool reads geometry. It can say a ripple is there, how strong, and whether every image carries it. It cannot say who or what put it there: interference and scanner noise make whole-frame ripples too.',
+      'One image has limits: a very faint or very wide ripple can hide under busy detail. Stacking several images from the same source looks much deeper.',
       'Use the original file. A screenshot or a copy re-saved by a chat app has different pixels.'
     ];
     if (isStack) how = [
       'Stacking works on what the images have in common. Each picture is different, so its content shrinks as more images are added; a pattern in the same place in every image keeps its full strength.',
-      'Two stacks are made: the plain average of the images (flat-image averaging) and the average of their noise residuals. Both are scanned at every frequency, with the same tests as for one image.',
+      'Two stacks are made: the plain average of the images (flat-image averaging) and the average of their noise residuals. Both are scanned at every frequency.',
       'Each pattern is then looked up in every image separately. If the images agree on its alignment far more than chance allows, it is marked as shared; if not, it comes from individual images.',
       'Use images of the same pixel size, of different scenes, straight from the same source. Ten to thirty is a good number. Images that are already plain (a white or grey frame) show a shared pattern most directly.'
-    ].concat(how.slice(1));
+    ].concat([how[0], how[2], how[4]]);
     how = how.concat(rep.notes);
     root.appendChild(el('section', null, [el('h2', { text: 'How to read this' }), list(how)]));
   }
